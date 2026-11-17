@@ -40,11 +40,51 @@
 #define ENABLE_CROSS 1
 #define ENABLE_ROUND 1
 
-/* ---- 元素识别判据（按 IPS200 画面现场调整） ---- */
-#define ROUND_ROW       37    //环岛判定所用重采样点序号（间距3px → 约111px前瞻）
-#define ROUND_NEAR_X    20    //该点 x 小于此值：边界已收到车头附近
-#define ROUND_FAR_MAX   11    //对侧边界点数量上限
-#define CROSS_MAX       14    //十字判定：两侧边界点数上限
+/* ---- 元素识别判据（按当前视野窗口标定，改窗口必须重标） ----
+ * 窗口行 10~99、重采样间距 3：直道单侧边界重采样后只有 21~28 点
+ * （仿真：起点行 95 → 42 原始点 → 28；被车身挡到行 77 → 33 → 21）。
+ * 因此**不能再按"第 37 个点"这种整幅画面的量级写判据**——37 > 28，
+ * 数学上永远取不到，环岛入口会一直不触发。现在改成三条与窗口同尺度的条件：
+ *   1. 外侧边界点数 > ROUND_MIN_PTS(16)：确实是一条健康的长边界；
+ *   2. 外侧边界末点伸到 ROUND_FAR_ROW(VIEW_FAR_ROW+8) 以内：说明它是贴着
+ *      赛道外侧一路伸向远端的直线，而不是在弯里从画面侧边拐出去的；
+ *   3. 内侧边界短：被拐点裁短，或者整条丢失后只剩 0~2 点。
+ * 换摄像头俯仰角、安装高度或窗口尺寸后，应实测 `L`/`R` 重新确定这三个值。 */
+#define ROUND_MIN_PTS   16    //外侧边界最少点数（直道约 21~28）
+/* 内侧边界点数量上限：取 4 而不是 11。环岛入口处内侧线是"整条消失"（重采样后 0~2 点），
+ * 而普通弯道里内侧线只是被拐点裁短，通常还剩 3~5 点；门槛收紧后才能把两者分开。
+ * 判据直接用 loadRoad() 输出的 LRoadCount / RRoadCount，不要额外要求"拐点非零"：
+ * 有拐点时这两个数等于拐点序号（≥ 3），没有拐点时等于原始点数（0~2），两种情况都 < 4。
+ * 一旦加上 LCorner / RCorner 非零，后者（内侧线整条消失，正是环岛入口的主要工况）
+ * 就被排除掉了：LCorner 为 0 时 LRoadCount 就是原始点数 0~2，条件反而恒不成立，
+ * 只剩"拐点恰好落在第 3 点"这一种能进，数学上几乎不可达。
+ * 现场若发现入口触发偏晚，先把它加到 6 试。 */
+#define ROUND_FAR_MAX   4     //内侧边界点数量上限（短边界 = 缺口）
+#define ROUND_FAR_ROW   (VIEW_FAR_ROW + 8)   //外侧边界末点必须伸到该行以内
+#define CROSS_MAX       14    //十字判定：两侧边界点数上限（配合 Cross.h 的入口门槛）
+
+/* 元素超时：按"阶段"计时（RUN_MODE + 元素内部阶段），阶段一变就重置预算。
+ * 原来五阶段共享一个 8 s，大环岛单圈超时会在圆周中途被强制复位。 */
+#define ELEM_TIMEOUT_MS     8000
+/* 总预算：阶段来回翻转时单阶段计时会被反复重置，这里再压一层总上限，
+ * 保证任何元素都不会无限占用。 */
+#define ELEM_TOTAL_MS       20000
+
+/* 发车宽限：起步瞬间视觉还没稳定，这段时间不判出界。
+ * 与 OUT_BLIND_MS(200 ms) 是两套独立机制，宽限期一过立刻按正常判据走。 */
+#define OUT_START_GRACE_MS  300
+
+/* ===== 出界判定参数（宁可晚停，不可误停） =====
+ * 摄像头视场远大于赛道，画面里本来就有大量场地外的暗区，靠几个像素点判"冲出赛道"
+ * 非常容易误判。现在的结论要三条信号同时成立，且都要持续：
+ *   1. 5 个采样点全部偏暗（采样点已放到车身顶边以上、赛道内侧，见 outSamplePt）；
+ *   2. 距最近一次"看到赛道"已超过 OUT_BLIND_MS（短暂丢边不判）；
+ *   3. 连续 OUT_CONFIRM_FRAMES 帧都成立，之后控制中断再做 3 拍（15 ms）消抖。
+ * 实车若觉得冲出后停得太晚，先调小 OUT_BLIND_MS，再考虑减少确认帧数。 */
+#define OUT_SAMPLE_POINTS   5     //采样点个数
+#define OUT_SEEN_POINTS     3     //任一侧边界点数超过该值即算"看到赛道"
+#define OUT_BLIND_MS        200   //连续这么久没看到赛道才允许判出界
+#define OUT_CONFIRM_FRAMES  3     //连续成立帧数（按帧计，约 30~60 ms）
 
 /* 调试：上电即自动进入 RUNNING，以开环固定占空比自动前进（不用按 B2）。
  * 0 = 正常流程（按 B2 发车）。上车前必须改回 0 */
@@ -59,11 +99,28 @@
 
 int16 LCorner, RCorner, centerLineCount, RUN_MODE = FORWARD;
 volatile int16 LRoadCount = expRoadCount, RRoadCount = expRoadCount; //中断里做出界判断，需要 volatile
+/* 原始边界点数（拐点裁短之前）：环岛状态机的"边界消失→恢复"必须看原始值。
+ * 下面的拐点分支会把 LRoadCount/RRoadCount 裁成 LCorner/RCorner（3~10），
+ * 若状态机继续用裁短值判 ">10 且无拐点"，两个条件永远不能同时成立，
+ * READY → START 在数学上不可达——这是"环岛进得去、走不完"的直接原因。 */
+int16 LRawCount = 0, RRawCount = 0;
+/* 阈值重估请求：elementReset() 可能在主循环帧处理块之外被调用（发车 / 完赛），
+ * 那时 frameBusy == 0，DMA 中断可能正在整帧拷贝快照，直接扫像素会读到半帧。
+ * 这里只置标志，真正的重估放到下一帧的 loadRoad() 里做。 */
+static uint8 threshReload = 0;
 static int16 borderInTriggerDistance = 25;
 volatile uint8 borderIn; //主循环写、中断读
 uint8 switch1, switch2, ALONG = ALONG_R;
 Point centerLine[expRoadCount], LRoad[expRoadCount], RRoad[expRoadCount];
 extern int16 currentDuty;
+extern int16 aimRowDbg;       // alongLine 本帧前瞻点行号，debugReport 的 AIM 字段
+extern uint16 dropFrameCnt;   // Image.c 统计的丢帧数，debugReport 的 DROP 字段
+
+/* 元素内部阶段查询：只用于"按阶段重置超时预算"。
+ * 三个头文件是 GBK 编码，这里直接前置声明，避免改头文件时把编码搅乱。 */
+uint8 crossStage(void);
+uint8 lroundStage(void);
+uint8 rroundStage(void);
 
 /* 8 组整定参数：{舵机增益 c1, 前瞻点序号 c3, 弯道限速系数 c4, 直道限速 c5}
  *   c1：每 1 度图像角度对应的舵机 duty = c1 / STEER_DUTY_DIV（见 Motor.h）
@@ -85,7 +142,11 @@ static const int16 speedSet[8][4] = {
 };
 
 static void applySpeedSet(uint8 idx) {
-    motorInit(speedSet[idx][0], speedSet[idx][1], speedSet[idx][2], speedSet[idx][3], 0);
+    /* 第 7 参数是纯跟踪等效轴距。原来固定传 0（等于让 motorInit 保持内部默认），
+     * 结果 Motor.h 里"调 c7 把等效轴距往 30~50 加"这条建议在工程里没有入口。
+     * 现在统一由 PP_LOOKAHEAD_PX 给出，改那一个宏即可对 8 档同时生效。 */
+    motorInit(speedSet[idx][0], speedSet[idx][1], speedSet[idx][2], speedSet[idx][3],
+              PP_LOOKAHEAD_PX);
 }
 
 void loadRoad();
@@ -160,9 +221,23 @@ void elementReset(void) {
     centerLineCount = 0;
     LCorner = RCorner = 0;
     LRoadCount = RRoadCount = expRoadCount;
+    LRawCount = RRawCount = 0;
     outOfTrack = 0;
+    /* 重新发车/元素超时复位时重估阈值：原来阈值只在 main() 初始化时估一次，
+     * 若视觉曾进入"爬线失败→阈值冻结"的死锁，停车后按 B2 也起不来，
+     * 只能断电。这里只置标志，由下一帧的 loadRoad() 在快照空闲时执行，
+     * 避免在 DMA 整帧拷贝期间读到半帧。 */
+    threshReload = 1;
     gpio_set_level(IO_P90, 0);
 }
+
+/* ===== 出界判定的时间/帧数状态 =====
+ * outSeenMs 是最近一次"看到赛道"（任一侧边界点数够）的时刻，用来实现"短暂丢边不判"；
+ * outFrameCnt 是"5 点全暗且长时间没看到赛道"连续成立的帧数；
+ * darkCount 是最近一帧的暗点数，作为串口 DARK 字段输出，现场标定采样点时看它。 */
+static uint16 outSeenMs = 0;
+static uint8 outFrameCnt = 0;
+static uint8 darkCount = 0;
 
 /* ===== USB CDC 调试输出 =====
  * 屏幕已从硬件上移除，里程标定、阈值、故障码全部靠 USB CDC 读取（debug_init 已打开）。
@@ -179,22 +254,48 @@ static void debugReport(uint8 running) {
     interrupt_global_disable();
     odo = odometer;
     interrupt_global_enable();
-    printf("ODO=%ld L=%d R=%d C=%d THR=%d MODE=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\n",
-           odo, LRoadCount, RRoadCount, centerLineCount, threshold,
-           RUN_MODE, ALONG, trackIsOn(), faultFlags, currentSpeed, setSpeed, currentDuty);
+    printf("ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\n",
+           odo, LRawCount, RRawCount, centerLineCount, aimRowDbg, threshold, darkCount,
+           dropFrameCnt, RUN_MODE, ALONG, trackIsOn(), faultFlags, currentSpeed, setSpeed,
+           currentDuty);
 }
 
-/* 出界采样的 5 个点：车头前方与两侧。返回低于阈值的个数。
- * 原来把「两侧边界全丢」单独作为出界条件，弯道里边界跑出窄列搜索范围、
- * 两侧起点同时失败时会被当成冲出赛道，发车十几毫秒后就停车。 */
-static uint8 darkPoints(void) {
-    uint8 n = 0;
+/* ===== 出界采样点 =====
+ * 采样点同时受三条约束：
+ *   1. 行必须小于 BODY_ROW（车身在画面里的最上行），否则读到的是车身暗块。
+ *      原来近端三点放在 84~88 行，20 cm / 45° 安装后车身已经顶到 80 行，
+ *      这三点长期就是暗的——远端两点一暗就凑齐"5 点全暗"，直道上偶发停车
+ *      多半出在这里；
+ *   2. 列要落在赛道内侧。摄像头视场远大于赛道，画面左右两侧是场地外暗区，
+ *      原 47 / 141 在偏窄赛道上已经在线外，等于又白送两个暗点；
+ *   3. 越远的行赛道越窄，列要同步内收，保持 5 个点都落在赛道里。
+ *   4. 全部落在视野窗口内（行 10~99、列 34~153），窗口外是写成暗区的区域。
+ * 现场标定：直道正常行驶时这 5 个点的暗点数应为 0（串口 DARK 字段可观察）。 */
+#define OUT_ROW_NEAR  (BODY_ROW - 4)   //近端采样行 = 76，车身顶边以上留 4 像素余量
 
-    if (mt9v03x_frame[84][95] < threshold) n++;
-    if (mt9v03x_frame[88][47] < threshold) n++;
-    if (mt9v03x_frame[87][141] < threshold) n++;
-    if (mt9v03x_frame[75][120] < threshold) n++;
-    if (mt9v03x_frame[74][64] < threshold) n++;
+/* 左右侧点收到 ±20：仿真里窄赛道（宽 40，列 74~114）时 ±24 会落到赛道外，
+ * 单侧再丢边就凑到 5 点全暗；±20 在窄赛道刚好压在边界上，宽赛道不受影响。 */
+static const uint8 outSamplePt[OUT_SAMPLE_POINTS][2] = {
+    {OUT_ROW_NEAR,      94},  //车头正前方
+    {OUT_ROW_NEAR - 2,  74},  //左前
+    {OUT_ROW_NEAR - 2, 114},  //右前
+    {OUT_ROW_NEAR - 10, 80},  //左远（行更远、赛道更窄，列内收）
+    {OUT_ROW_NEAR - 10, 108}  //右远
+};
+
+/* 返回 5 个采样点里低于阈值的个数。每点取 3×3 块均值，
+ * 单像素反光或坏点不足以把整个采样点判成暗。 */
+static uint8 darkPoints(void) {
+    uint8 n = 0, k, i, j;
+    uint16 sum;
+
+    for (k = 0; k < OUT_SAMPLE_POINTS; k++) {
+        sum = 0;
+        for (i = outSamplePt[k][0] - 1; i <= outSamplePt[k][0] + 1; i++)
+            for (j = outSamplePt[k][1] - 1; j <= outSamplePt[k][1] + 1; j++)
+                sum += mt9v03x_frame[i][j];
+        if ((uint8) (sum / 9) < threshold) n++;
+    }
     return n;
 }
 
@@ -298,12 +399,21 @@ void main(void) {
     frameBusy = 0;   // 丢弃选档期间累积的旧帧，第一拍处理发车后的当前画面
     while (1) {
         static uint16 lastFrameMs = 0;   // 最近一次收到完整帧的时刻
-        static uint16 elemEnterMs = 0;   // 进入元素的时刻
+        static uint16 elemEnterMs = 0;   // 进入当前元素阶段的时刻
+        static uint8 elemStage = 0;      // 当前元素阶段编号（RUN_MODE + 元素内部阶段）
+        static uint16 elemSessionMs = 0; // 本次元素会话的起始时刻（总预算用）
+        static uint8 elemSessionOn = 0;  // 1 = 正处于某个元素中
         static uint16 runStartMs = 0;    // 最近一次进入 RACE_RUNNING 的时刻
         static uint8 lastRaceState = 0;  // 上一次的比赛状态，用于捕捉状态切换
-        /* 记下发车时刻：出界判定在发车后 800 ms 内不生效 */
+        /* 记下发车时刻：出界判定在发车后 OUT_START_GRACE_MS 内不生效。
+         * 同时清掉出界判定的盲区计时与帧计数，避免沿用上一轮的"很久没看到赛道"。 */
         if (raceState != lastRaceState) {
-            if (raceState == RACE_RUNNING) runStartMs = msTick;
+            if (raceState == RACE_RUNNING) {
+                runStartMs = msTick;
+                outSeenMs = msTick;
+                outFrameCnt = 0;
+                darkCount = 0;
+            }
             lastRaceState = (uint8) raceState;
         }
         /* 按键与里程判定不依赖相机帧：摄像头停帧时仍能急停 / 收车 */
@@ -344,8 +454,7 @@ void main(void) {
             lastFrameMs = msTick;   // 收到完整帧，喂狗
             loadRoad();
             /* 出界判定放在这里：此刻快照不会被 DMA 搬运覆盖，读像素是安全的；
-             * 结论交给控制中断做 15 ms 消抖，控制中断不再直接访问整帧图像。
-             * 判据与参考实现一致：两侧边界全丢，或 5 个采样点全暗。 */
+             * 结论交给控制中断做 15 ms 消抖，控制中断不再直接访问整帧图像。 */
             trackEvaluate();        // 用同一份边界点数更新赛道状态，供发车许可与蓝灯使用
 #if (ENABLE_BEND_ENTRY)
             /* 入弯过渡区识别：在直道与弯道的连接处，画面里没有边界是正常现象。
@@ -355,40 +464,67 @@ void main(void) {
             {
                 uint8 dark = darkPoints();
                 uint8 guard = 0;
+                uint8 blind;
 #if (ENABLE_BEND_ENTRY)
                 guard = bendEntryGuard();
 #endif
+                darkCount = dark;   // 串口观测用：直道正常行驶时应为 0
+                /* 任一侧边界点数够就算"看到赛道"，把盲区计时清零。
+                 * 这样"看不见赛道"必须持续 OUT_BLIND_MS 才成立，短暂丢边不算。
+                 * 必须用裁短前的 LRawCount / RRawCount：LRoadCount 在拐点分支里会被
+                 * 覆盖成 LCorner（3~13），十字与环岛阶段恒小于等于门槛，
+                 * 用裁短值判"看到赛道"会让 blind 在整个元素期间一直成立，
+                 * 元素里的黑区一旦凑够暗点就会把车停死。 */
+                if (LRawCount > OUT_SEEN_POINTS || RRawCount > OUT_SEEN_POINTS) outSeenMs = msTick;
+                blind = (uint8) ((uint16) (msTick - outSeenMs) >= OUT_BLIND_MS);
+
                 if (guard >= 2) {
                     /* 连接处时间窗内：完全免判，画面里的黑区是弯道外侧的底布 */
+                    outFrameCnt = 0;
                     outOfTrack = 0;
-                } else if (guard == 1) {
-                    /* 已确认入弯：单侧丢边属于常态，只有 5 点全暗才算冲出 */
-                    outOfTrack = (uint8) (dark >= 5);
+                } else if (dark >= OUT_SAMPLE_POINTS && blind) {
+                    /* 5 点全暗 + 已经 OUT_BLIND_MS 没看到赛道，两条同时成立才开始计帧。
+                     * 任一条不成立立刻清零：直道上偶发的阴影、反光、丢边都不会停车。 */
+                    if (outFrameCnt < 100) outFrameCnt++;
+                    outOfTrack = (uint8) (outFrameCnt >= OUT_CONFIRM_FRAMES);
                 } else {
-                    /* 5 点全暗：画面里确实没有赛道，直接出界。
-                     * 两侧边界全丢时要求至少 3 点暗：弯道里边界跑出搜索范围很常见，
-                     * 只要画面还有亮区就说明车没冲出去，不能停。 */
-                    outOfTrack = (uint8) ((dark >= 5) ||
-                                          ((!LRoadCount && !RRoadCount) && dark >= 3));
+                    outFrameCnt = 0;
+                    outOfTrack = 0;
                 }
                 /* 发车后的宽限期：起步瞬间视觉还没稳定，先不判出界 */
-                if ((uint16) (msTick - runStartMs) < 800) outOfTrack = 0;
+                if ((uint16) (msTick - runStartMs) < OUT_START_GRACE_MS) {
+                    outFrameCnt = 0;
+                    outSeenMs = msTick;
+                    outOfTrack = 0;
+                }
             }
             if (raceState == RACE_RUNNING || raceState == RACE_BRAKING) {
                 if (ENABLE_CROSS && (RUN_MODE == CROSS ||
-                                     (RUN_MODE == FORWARD && ((RCorner && RRoadCount > 2) || (LCorner && LRoadCount > 2)) &&
-                                      LRoadCount < CROSS_MAX && RRoadCount < CROSS_MAX))) {
+                                     (RUN_MODE == FORWARD &&
+                                      ((RCorner && RRoadCount > 2) || (LCorner && LRoadCount > 2)) &&
+                                      LRoadCount < CROSS_MAX && RRoadCount < CROSS_MAX &&
+                                      /* 与 Cross.c 的 READY 门槛一致：否则会切到 CROSS
+                                       * 却永远进不了补线，ALONG/borderIn 被冻结到超时 */
+                                      centerLineCount && centerLineCount < CROSS_ENTER_COUNT))) {
                     RUN_MODE = CROSS;
                     runCross();
                 } else if (ENABLE_ROUND && (RUN_MODE == R_ROUND ||
-                                            (RUN_MODE == FORWARD && LRoadCount > ROUND_ROW && LRoad[ROUND_ROW].x < ROUND_NEAR_X &&
-                                             RCorner && RRoadCount < ROUND_FAR_MAX))) {
+                                            (RUN_MODE == FORWARD && LRawCount > ROUND_MIN_PTS &&
+                                             LRoad[LRawCount - 1].x <= ROUND_FAR_ROW &&
+                                             /* 不再要求 RCorner 非零：RRoadCount 已经把
+                                              * 「被拐点裁短」(= 拐点序号 ≥3) 与「整条消失」
+                                              * (= 原始点数 0~2) 合并在一起，多加一项就把
+                                              * 主要的入口工况排除掉了 */
+                                             RRoadCount < ROUND_FAR_MAX))) {
                     RUN_MODE = R_ROUND;
                     borderIn = 1;
                     runRRound(LCorner, RCorner);
                 } else if (ENABLE_ROUND && (RUN_MODE == L_ROUND ||
-                                            (RUN_MODE == FORWARD && RRoadCount > ROUND_ROW && RRoad[ROUND_ROW].x < ROUND_NEAR_X &&
-                                             LCorner && LRoadCount < ROUND_FAR_MAX))) {
+                                            (RUN_MODE == FORWARD && RRawCount > ROUND_MIN_PTS &&
+                                             RRoad[RRawCount - 1].x <= ROUND_FAR_ROW &&
+                                             /* 与右侧环岛同理：LCorner 非零会把
+                                              * 「内侧线整条消失」这种工况排除掉 */
+                                             LRoadCount < ROUND_FAR_MAX))) {
                     RUN_MODE = L_ROUND;
                     borderIn = 1;
                     runLRound(LCorner, RCorner);
@@ -402,17 +538,46 @@ void main(void) {
                         alongLine(centerLine, centerLineCount, getAimPos());
                 }
 
-                /* 元素超时兜底：卡在十字/环岛超过 8 s 就强制回 FORWARD，
-                 * 否则会一直用固定 aim 打角、全速冲出赛道。
+                /* 元素超时兜底：按"元素阶段"计时，而不是整个元素。
+                 * 环岛五阶段（READY→START→IN→END→EXIT）每进一个阶段就重置预算，
+                 * 否则单圈环岛总耗时会吃掉 8 s 预算、在圆周中途被强制复位。
                  * 计时按真实毫秒而不是帧数，帧率波动时阈值不会跟着漂。 */
-                if (RUN_MODE == FORWARD)
-                    elemEnterMs = msTick;
-                else if ((uint16) (msTick - elemEnterMs) > 8000) {
-                    elemEnterMs = msTick;
-                    elementReset();
+                {
+                    uint8 stage = 0;
+                    if (RUN_MODE == R_ROUND) stage = (uint8) (1 + rroundStage());
+                    else if (RUN_MODE == L_ROUND) stage = (uint8) (8 + lroundStage());
+                    else if (RUN_MODE == CROSS) stage = (uint8) (16 + crossStage());
+
+                    if (RUN_MODE == FORWARD) {
+                        elemEnterMs = msTick;
+                        elemStage = 0;
+                        elemSessionOn = 0;
+                    } else {
+                        if (!elemSessionOn) {
+                            elemSessionOn = 1;
+                            elemSessionMs = msTick;
+                        }
+                        if ((uint16) (msTick - elemSessionMs) > ELEM_TOTAL_MS) {
+                            /* 总预算兜底：阶段来回翻转会不断重置单阶段计时，
+                             * 这里保证任何元素最多占用 ELEM_TOTAL_MS */
+                            elemSessionOn = 0;
+                            elemEnterMs = msTick;
+                            elemStage = 0;
+                            elementReset();
+                        } else if (stage != elemStage) {
+                            elemEnterMs = msTick;   // 进入新阶段：重置单阶段预算
+                            elemStage = stage;
+                        } else if ((uint16) (msTick - elemEnterMs) > ELEM_TIMEOUT_MS) {
+                            elemEnterMs = msTick;
+                            elemStage = 0;
+                            elementReset();
+                        }
+                    }
                 }
             } else {
                 elemEnterMs = msTick;
+                elemStage = 0;
+                elemSessionOn = 0;
             }
             frameBusy = 0;   // 消费完毕，允许 ISR 搬入下一帧
         } else if ((uint16) (msTick - lastFrameMs) > 1000) {
@@ -459,15 +624,19 @@ static void buildCenterLine(Point ml[], int16 mlc, Point mr[], int16 mrc) {
     for (i = 0; i < sc && k < expRoadCount; i++) {
         best = -1;
         bestD = 0x7FFF;
-        /* 两条边界都按近→远排列（行号递减），游标只向前推进 */
-        while (j + 1 < oc && other[j].x > skel[i].x) j++;
-        /* 游标附近取行号最接近的点，容忍重采样带来的 1~2 像素错位 */
-        for (t = j - 2; t <= j + 2; t++) {
-            if (t < 0 || t >= oc) continue;
-            d = func_abs((int16) other[t].x - (int16) skel[i].x);
-            if (d < bestD) {
-                bestD = d;
-                best = t;
+        /* 对侧点数少于 3 时不做配对：游标卡在 oc-1 附近，
+         * 后续骨架点会持续误配到同一个点，不如直接按单侧外推。 */
+        if (oc >= 3) {
+            /* 两条边界都按近→远排列（行号递减），游标只向前推进 */
+            while (j + 1 < oc && other[j].x > skel[i].x) j++;
+            /* 游标附近取行号最接近的点，容忍重采样带来的 1~2 像素错位 */
+            for (t = j - 2; t <= j + 2; t++) {
+                if (t < 0 || t >= oc) continue;
+                d = func_abs((int16) other[t].x - (int16) skel[i].x);
+                if (d < bestD) {
+                    bestD = d;
+                    best = t;
+                }
             }
         }
         centerLine[k].x = skel[i].x;
@@ -499,7 +668,19 @@ static void buildCenterLine(Point ml[], int16 mlc, Point mr[], int16 mrc) {
 void loadRoad() {
     int16 idx, midLc, midRc;
     uint8 leftFound = 0, rightFound = 0;
-    Point LStart = getLStart(), RStart = getRStart();
+    Point LStart, RStart;
+
+    /* 先按视野窗口屏蔽四周的视场外区域，再找起点：远端行、近端车身、
+     * 左右边缘的反光与底布会被爬线当成赛道，拟合出不存在的边界。 */
+    cutViewRegion();
+    /* 复位后请求的阈值重估放在这里：此刻主循环持有快照（frameBusy == 1），
+     * DMA 不会再往里写，读整帧是安全的 */
+    if (threshReload) {
+        threshReload = 0;
+        LThreshold = RThreshold = threshold = imageInitThreshold();
+    }
+    LStart = getLStart();
+    RStart = getRStart();
     if (RUN_MODE == FORWARD) centerLineDistance = 18; //普通循迹恢复默认补线偏移
     LRoadCount = expRoadCount, RRoadCount = expRoadCount;
     getLBorder(LRoad, LStart, &LRoadCount);
@@ -537,6 +718,8 @@ void loadRoad() {
     filterRoad(RRoad, RRoadCount);
     resampleRoad(LRoad, &LRoadCount, 0, 3);
     resampleRoad(RRoad, &RRoadCount, 0, 3);
+    LRawCount = LRoadCount;   // 拐点裁短前的原始点数，供环岛状态机与入口判据使用
+    RRawCount = RRoadCount;
     LCorner = findCorner(LRoad, LRoadCount, 0);
     RCorner = findCorner(RRoad, RRoadCount, 0);
     /* 下面的拐点分支会把全局点数裁到拐点处供元素判据使用。
@@ -583,9 +766,12 @@ void loadRoad() {
     buildCenterLine(midL, midLc, midR, midRc);
     if (centerLineCount >= 2) {
         int16 startPos = 0;
+        /* 首点锚到视野窗口下沿，而不是画面底边（行 119）：近端 20 行已裁掉，
+         * 锚到 119 会在首点与第一个真实点之间插进十个纯插值点，
+         * 前瞻点落在这段合成线上，横向偏差被拉平。 */
         for (idx = 1; idx < centerLineCount; idx++)
-            if (centerLine[idx].x < MT9V03X_H - 1) { startPos = idx - 1; break; }
-        centerLine[startPos].x = MT9V03X_H - 1;
+            if (centerLine[idx].x < VIEW_NEAR_ROW - 2) { startPos = idx - 1; break; }
+        centerLine[startPos].x = VIEW_NEAR_ROW;
         centerLine[startPos].y = centerLine[func_limit_ab(startPos + 1, 0, centerLineCount - 1)].y;
         filterRoad(centerLine, centerLineCount);
         resampleRoad(centerLine, &centerLineCount, startPos, 2);
@@ -597,26 +783,3 @@ void loadRoad() {
     if (RUN_MODE == FORWARD)
         ALONG = LRoadCount > RRoadCount ? ALONG_L : ALONG_R;
 }
-
-/*　　┏┓　　┏┓
-   　　┏┛┻━━━┛┻┓
-   　　┃　　　　　　　 ┃ 　
-   　　┃　　　━　　　 ┃
-   　　┃　＞　　　＜┃
-   　　┃　　　　　　　 ┃
-   　　┃ . ⌒　..┃
-   　　┃　　　　　　　 ┃
-   　　┗━┓　　　┏━┛
-     　　　　┃　　　┃　Guardian beasts, protect me; bad luck, stay away!　　　　　
-     　　　　┃　　　┃  神兽护体，水逆退散！
-     　　　　┃　　　┃　　　　　　　　　　　
-     　　　　┃　　　┃ 　　　　　　
-     　　　　┃　　　┃
-     　　　　┃　　　┃　　　　　　　　　　　
-     　　　　┃　　　┗━━━┓
-     　　　　┃　　　　　　　┣┓
-     　　　　┃　　　　　　　┏┛
-     　　　　┗┓┓┏━┳┓┏┛
-      　　　　　┃┫┫　┃┫┫
-      　　　　　┗┻┛　┗┻┛
- */

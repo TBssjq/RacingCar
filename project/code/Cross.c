@@ -6,8 +6,13 @@
 
 #define CROSS_READY 1
 #define CROSS_IN 2
+
+/* 入口/出口阈值带（按当前视野窗口的点数量级标定）：窗口行 10~99、重采样间距 2，
+ * 正常直道中线约 40 点。CROSS_ENTER_COUNT 放在 Cross.h，main.c 的入口判据
+ * 与这里必须用同一个门槛，否则会出现"RUN_MODE 已切到 CROSS 但状态机不补线"。 */
 extern uint8 switch2;
 extern int16 centerLineCount, RUN_MODE;
+extern int16 LBorderCount, RBorderCount;   // 出口旁路判断"两侧边界是否已恢复"用
 extern Point centerLine[expRoadCount];
 
 static int8 CROSS_MODE = CROSS_READY, canEnd = 0;
@@ -28,10 +33,14 @@ Point getCrossRStart() {
                 break;
             }
         }
-        // 直道上 y 单调不增时循环一次都不会 break，必须给确定起点
+        /* 直道上 y 单调不增时循环一次都不会 break，必须给确定起点。
+         * 这里只能用本次扫描得到的 min：minMaxH 仅在"列号出现回折"的 else 分支里
+         * 赋值，单调边界（直道、弯道外侧）下它始终是 0，起点会落成 (80, 0) ——
+         * 那一列已被 cutViewRegion 写成暗区，爬线会在暗区里沿对角线爬出几十个假点。
+         * RBorderCount 为 0 时本次没有可用列号，退回缓存值。 */
         if (!found) {
             pos.x = 80;
-            pos.y = (uint8) minMaxH;
+            pos.y = (RBorderCount > 0) ? (uint8) min : (uint8) minMaxH;
         }
     } else {
         pos.x = 80;
@@ -59,9 +68,11 @@ Point getCrossLStart() {
                 break;
             }
         }
+        /* 与 getCrossRStart() 同理：单调边界下 minMaxH 一直是 0，
+         * 兜底必须用本次扫描得到的 max */
         if (!found) {
             pos.x = 80;
-            pos.y = (uint8) minMaxH;
+            pos.y = (LBorderCount > 0) ? (uint8) max : (uint8) minMaxH;
         }
     } else {
         pos.x = 80;
@@ -86,7 +97,7 @@ void runCross() {
 #endif
     if (CROSS_MODE == CROSS_READY) {
         //gpio_set_level(IO_P90, 1);
-        if (centerLineCount && centerLineCount < 13) {
+        if (centerLineCount && centerLineCount < CROSS_ENTER_COUNT) {
             crossThreshold = (threshold + LThreshold) >> 1;
             alongR = LBorderCount < RBorderCount;
             CROSS_MODE = CROSS_IN;
@@ -125,12 +136,19 @@ void runCross() {
             corner = func_min(corner + 3, farCenterLineCount - 1);
         else
             corner = func_min(5, farCenterLineCount - 1);
-        farCenterLine[corner].x = MT9V03X_H - 1;
+        /* 补线终点必须落在"车头行"上：原来写 MT9V03X_H-1（行 119），
+         * 视野窗口裁到行 99 以后这段落在车身/窗口之外，沿线的 dx 会变成 0 或负值，
+         * 纯跟踪的 atan 直接打满舵。 */
+        farCenterLine[corner].x = VIEW_NEAR_ROW;
         farCenterLine[corner].y = MT9V03X_W / 2 - 3;
         resampleRoad(farCenterLine, &farCenterLineCount, corner, 2);
         filterRoad(farCenterLine, farCenterLineCount);
         alongLine(farCenterLine, farCenterLineCount, getAimPos());
-        if (centerLineCount > 20 && canEnd) {
+        /* 出口条件：中线恢复到正常长度，且（两侧边界都消失过——canEnd，
+         * 或此刻两侧边界都已恢复）。原来只认 canEnd：若入口在单侧丢边时
+         * 提前触发、两侧从未同时消失，canEnd 永远为 0，十字会补线到
+         * 8 s 超时才退出——这就是"十字补线后出不来"。 */
+        if (centerLineCount > CROSS_EXIT_COUNT && (canEnd || (LBorderCount && RBorderCount))) {
             canEnd = minMaxH = 0;
             banUpdateThreshold = 0;   // 退出十字才解除阈值冻结
             CROSS_MODE = CROSS_READY;
@@ -147,4 +165,9 @@ void crossReset(void) {
     alongR = 0;
     crossThreshold = 0;
     banUpdateThreshold = 0;
+}
+
+/* 当前阶段（1=READY 2=IN）：主循环按它重置元素超时预算 */
+uint8 crossStage(void) {
+    return (uint8) CROSS_MODE;
 }

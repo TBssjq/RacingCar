@@ -11,13 +11,22 @@
 
 #include "zf_common_headfile.h"
 
+/* 屏幕已经硬件移除：显式给默认值，避免 #if (ENABLE_SCREEN) 因"宏未定义"
+ * 被 C 预处理器静默判 0 —— 那种失效既不报错也不易察觉。 */
+#ifndef ENABLE_SCREEN
+#define ENABLE_SCREEN   0
+#endif
+
 /* 是否要求「先标定一圈」才允许发车：
  *   0 = 调试放行：不标定也能发车，且不会自动刹停（靠 B3 手动停车）
  *   1 = 正式比赛：未标定按 B2 拒绝发车（蓝灯闪 3 下） */
 #define CALIB_REQUIRED  0
 
 /* ---------------- 里程参数：上车后必须实测标定 ---------------- */
-#define PULSE_PER_METER     1000    // 每米脉冲数（推车走 1 米读取 odometer）
+/* 每米脉冲数：推车走 1 米读串口 ODO 的增量即为该值。
+ * 这个数与 Motor.h 里 SPEED_LIMIT 的换算注释必须一致（原来这里写 1000、
+ * 注释按 34600 换算，同一物理量差 34.6 倍）。标定后同时改这一处即可。 */
+#define PULSE_PER_METER     34600   // 每米脉冲数（推车走 1 米读取 odometer）
 #define LAP_DISTANCE_CM     1200    // 赛道一圈的长度 cm
 #define STOP_OFFSET_CM      100     // 过起跑线后继续前进的停车点 cm（必须 0~200）
 #define BRAKE_DISTANCE_CM   200     // 提前开始刹车的距离 cm（稳定优先：比原 150 多留 50 cm 制动余量）

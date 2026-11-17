@@ -8,6 +8,7 @@ BE_BEND_EXIT = 4
 BE_CONFIRM_FRAMES = 2
 BE_BLANK_MS = 250
 BE_MAX_LOST_MS = 900
+BE_MAX_APPROACH_MS = 400
 BE_RECOVER_POINTS = 15
 BE_MIN_POINTS = 8
 BE_TURN_DECAY = 1
@@ -52,6 +53,9 @@ class BendEntry:
                 if abs(d) >= BE_TURN_MIN:
                     self.hold = d
             elif bend < BE_BEND_EXIT:
+                self.state = STRAIGHT
+            elif ms - self.state_ms > BE_MAX_APPROACH_MS:
+                # 强度在 4~10 之间抖动时兜底回直道，避免长期停在"预备入弯"
                 self.state = STRAIGHT
 
         elif self.state == COMMITTED:
@@ -100,13 +104,12 @@ class BendEntry:
         return out
 
 
-def out_of_track(guard, dark, lc, rc):
-    """复现 main.c 的出界判定。"""
+def out_of_track(guard, dark):
+    """复现 main.c 的出界判定：guard >= 2 免判，其余情况只有 5 点全暗才可能出界。
+    完整判据还要求"200 ms 未见赛道 + 连续 3 帧"，见 out_of_track_check.py。"""
     if guard >= 2:
         return False
-    if guard == 1:
-        return dark >= 5
-    return (dark >= 5) or (lc == 0 and rc == 0 and dark >= 3)
+    return dark >= 5
 
 
 print("=== 1. 完整入弯序列：直道 → 确认 → 连接处 → 恢复 ===")
@@ -134,7 +137,7 @@ for n, (bend, d, lc, rc, dark) in enumerate(frames):
     g = be.guard(ms)
     print("  %2d  %4d  %3d  %+3d   %3d %3d  %2d  %-9s  %d    %s"
           % (n + 1, ms, bend, d, lc, rc, dark, NAMES[be.state], g,
-             "停车" if out_of_track(g, dark, lc, rc) else "继续"))
+             "停车" if out_of_track(g, dark) else "继续"))
 
 print()
 print("=== 2. 直道上误丢边：不能因为模块存在就放过 ===")
@@ -146,22 +149,22 @@ for n, (lc, rc, dark) in enumerate([(60, 58, 0), (0, 0, 3), (0, 0, 3), (0, 0, 5)
     g = be.guard(ms)
     print("  %2d  %4d  %3d %3d  %2d  %-9s  %d    %s"
           % (n + 1, ms, lc, rc, dark, NAMES[be.state], g,
-             "停车" if out_of_track(g, dark, lc, rc) else "继续"))
+             "停车" if out_of_track(g, dark) else "继续"))
 
 print()
-print("=== 3. 连接处超时：600 ms 后交还正常判据 ===")
+print("=== 3. 连接处超时：900 ms 后交还正常判据 ===")
 be = BendEntry()
 be.state = COMMITTED
 be.state_ms = 0
 be.hold = -9
-print("  毫秒  已丢失  宽容  出界(暗点=3)")
-for ms in (0, 100, 249, 250, 400, 599, 601, 800):
+print("  毫秒  已丢失  宽容  出界(暗点=5)")
+for ms in (0, 100, 249, 250, 400, 899, 901):
     be.lost_ms = ms
     if ms > BE_MAX_LOST_MS:
         be.state = RECOVER
         be.state_ms = ms
     g = be.guard(ms)
-    print("  %4d   %4d    %d    %s" % (ms, ms, g, "停车" if out_of_track(g, 3, 0, 0) else "继续"))
+    print("  %4d   %4d    %d    %s" % (ms, ms, g, "停车" if out_of_track(g, 5) else "继续"))
 
 print()
 print("=== 4. 转角保持与衰减（中线点数不足时）===")
@@ -195,7 +198,7 @@ for n, (bend, d, lc, rc) in enumerate(seq):
     be.update(ms, bend, d, lc, rc)
     print("  %2d  %4d  %3d  %+3d   %3d %3d  %-9s  %d"
           % (n + 1, ms, bend, d, lc, rc, NAMES[be.state], be.guard(ms)))
-print("  第 8 帧从 RECOVER 直接回 APPROACH，不经过 STRAIGHT")
+print("  S 弯之间出现强弯时从 RECOVER 直接回 APPROACH，不经过 STRAIGHT")
 
 print()
 print("=== 6. 大转弯幅度：连接处容忍时间延长到 900 ms ===")
@@ -232,6 +235,6 @@ for name, st in rows:
     g = be.guard(ms)
     print("  %-26s  %d    %-6s  %-6s  %-6s"
           % (name, g,
-             "停车" if out_of_track(g, 2, 0, 0) else "继续",
-             "停车" if out_of_track(g, 3, 0, 0) else "继续",
-             "停车" if out_of_track(g, 5, 0, 0) else "继续"))
+             "停车" if out_of_track(g, 2) else "继续",
+             "停车" if out_of_track(g, 3) else "继续",
+             "停车" if out_of_track(g, 5) else "继续"))

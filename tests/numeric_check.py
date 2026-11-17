@@ -46,11 +46,11 @@ def sqrt_int(x):
 
 
 # 与 Motor.c 完全一致的 tan 表（tan(度) × 1000，四舍五入）
+# 只到 30 度：atan2_int() 返回值上限 ±30，固件表长也是 31
 TANI = [
     0, 17, 35, 52, 70, 87, 105, 123, 141, 158, 176,
     194, 213, 231, 249, 268, 287, 306, 325, 344, 364,
     384, 404, 424, 445, 466, 488, 510, 532, 554, 577,
-    600, 628,
 ]
 
 DEVICE_H = 18
@@ -59,18 +59,24 @@ STEER_DUTY_LIMIT = 395
 SPEED_LIMIT = 400
 
 
+# 与 Motor.c / Motor.h 一致：纵向参考行取 STEER_REF_ROW = VIEW_NEAR_ROW = 99，
+# 不是画面底边 120（近端 20 行已被裁掉），且 dx 有 PP_DX_MIN 下限。
+STEER_REF_ROW = 99
+PP_DX_MIN = 30
+
+
 def along_line_angle(x, y):
-    dx = 120 - x + DEVICE_H
+    dx = STEER_REF_ROW - x + DEVICE_H
+    if dx < PP_DX_MIN:
+        dx = PP_DX_MIN
     dy = 94 - y
-    ax = dx * dx + dy * dy
+    ax = dx * dx + dy * dy          # dx >= PP_DX_MIN -> ax >= 900，恒 > 0
     ay = 2 * DEVICE_H * dy
-    if ax <= 0:
-        return 0
     return atan2_int(ay, ax)
 
 
 def curve_speed(d, c4, c5):
-    t = TANI[min(abs(d), 32)]
+    t = TANI[abs(d)]              # 与固件一致：|d| <= 30，表长 31，不再夹 32
     r = 0 if t == 0 else 20000 // t
     v = sqrt_int(r * c4) if c4 > 0 else 0
     target = c5 if r == 0 else min(v, c5)
@@ -119,7 +125,7 @@ worst = 0
 for i, v in enumerate(TANI):
     ref = round(math.tan(math.radians(i)) * 1000)
     worst = max(worst, abs(ref - v))
-print("最大偏差:", worst, "（1 度 ~ 32 度）")
+print("最大偏差:", worst, "（1 度 ~ 30 度）")
 
 print()
 print("=== 3. 曲率限速曲线：c4 = 2000, c5 = 400 ===")

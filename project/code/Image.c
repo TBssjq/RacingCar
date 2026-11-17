@@ -8,7 +8,12 @@ const static int8 data dirF[4][2] = {{-2, 0},{0, 2},{2, 0},{0, -2}},
     dirL[4][2] = {{-2, -2},{-2, 2},{2,  2},{2,  -2}},
     dirR[4][2] = {{-2, 2},{2,  2},{2,  -2},{-2, -2}};
 uint8 banUpdateThreshold = 0, LThreshold, RThreshold, threshold, centerLineDistance = 18;
+/* 去畸变查表只在 USE_REFLECTION = 1 时参与编译：
+ * 表本身 120×188×2 = 45120 B const，关闭时若不裁掉会白占约 45 KB Flash。
+ * 当前 20 cm / 45° 安装与表的 25 cm / 39° 标定不符，表已整体旁路。 */
+#if USE_REFLECTION
 const uint8 reflection[120][188][2];
+#endif
 const uint8 static data halfBlock = block / 2, data halfH = MT9V03X_H / 2, data halfW = MT9V03X_W / 2;
 Point LBorder[expRoadCount], RBorder[expRoadCount];
 int16 LBorderCount, RBorderCount;
@@ -20,6 +25,7 @@ int16 LBorderCount, RBorderCount;
  * TIM1 控制中断优先级 3、LCM_DMA 优先级 1（main.c 设置），控制中断可抢占本次搬运。 */
 uint8 mt9v03x_frame[MT9V03X_H][MT9V03X_W];
 volatile uint8 frameBusy = 0;
+uint16 dropFrameCnt = 0;   // 主循环没消费完就被丢弃的帧数（串口 DROP 字段），帧率诊断用
 
 void mt9v03x_frame_snapshot(void) {
     uint16 data i;
@@ -43,6 +49,26 @@ void mt9v03x_frame_snapshot(void) {
             src += 4;
         }
         frameBusy = 1;
+    } else {
+        dropFrameCnt++;   // 处理慢于帧率时的可预期降级：计数并在串口暴露，而不是无声丢帧
+    }
+}
+
+/* 视野窗口：把窗口以外（远端行、近端行、左右列）整块写成暗区，参数见 Image.h。
+ * 透视后的远端每行只对应几毫米，反光、背景、赛道外的深色区域都在这里；
+ * 近端是车身与车头阴影；左右边缘同样是场地。写成暗区后：
+ *   爬线不会伸进去，起点搜索与爬线判据也同步用窗口收紧边界。 */
+void cutViewRegion(void) {
+    uint8 i, j;
+
+    for (i = 0; i < MT9V03X_H; i++) {
+        for (j = 0; j < VIEW_COL_L; j++)
+            mt9v03x_frame[i][j] = 0;
+        for (j = VIEW_COL_R + 1; j < MT9V03X_W; j++)
+            mt9v03x_frame[i][j] = 0;
+        if (i < VIEW_FAR_ROW || i > VIEW_NEAR_ROW)
+            for (j = 0; j < MT9V03X_W; j++)
+                mt9v03x_frame[i][j] = 0;
     }
 }
 
@@ -70,11 +96,14 @@ uint8 getPointThreshold(uint8 x, uint8 y) {
     return (uint8) avg;
 }
 
-//用图像下部区域的灰度最小/最大中点估计初始阈值，不依赖固定采样点
+//用视野窗口内的灰度最小/最大中点估计初始阈值，不依赖固定采样点
 uint8 imageInitThreshold(void) {
     uint8 i, j, v, mn = 255, mx = 0;
-    for (i = 92; i < MT9V03X_H - 6; i += 2)
-        for (j = 6; j < MT9V03X_W - 6; j += 2) {
+    /* 取样范围必须落在窗口内并离边缘 4 像素：窗口外已被写成暗区，
+     * 取进去只会把最小/最大值压到 0，对比度判据直接失效。
+     * 原来固定取行 92~113，近端裁到行 99 以后会读到大片暗区。 */
+    for (i = VIEW_FAR_ROW + 4; i <= VIEW_NEAR_ROW - 4; i += 2)
+        for (j = VIEW_COL_L + 4; j <= VIEW_COL_R - 4; j += 2) {
             v = mt9v03x_frame[i][j];
             if (v < mn) mn = v;
             if (v > mx) mx = v;
@@ -92,7 +121,8 @@ static int8 check(uint8 x, uint8 y) {
 
 static int16 getLIndexStart(int16 i) {
     int16 l, r, m;
-    l = halfBlock + 1;
+    /* 左界从裁切框内侧起搜：框外的列已被写成暗区，参与二分只会把起点拉到框外 */
+    l = VIEW_COL_L + halfBlock;
     r = i < BODY_ROW ? halfW : HIDE_COL_L;
     while (l < r) {
         m = (l + r) >> 1;
@@ -105,9 +135,11 @@ static int16 getLIndexStart(int16 i) {
 Point getLStart() {
     int16 i, l;
     Point ans;
-    for (i = MT9V03X_H - halfBlock - 2; i >= 70; i -= 3) {
+    /* 扫描范围就是视野窗口的行区间：从窗口下沿往上找第一处灰度跳变。
+     * 窗口外整块是暗区，扫进去只会白费二分次数。 */
+    for (i = VIEW_NEAR_ROW - halfBlock - 2; i >= VIEW_FAR_ROW + 3; i -= 3) {
         l = getLIndexStart(i);
-        if (mt9v03x_frame[i][func_min(l + 2, 187)] > LThreshold && check(i, l)) {
+        if (mt9v03x_frame[i][func_min(l + 2, MT9V03X_W - 1)] > LThreshold && check(i, l)) {
             ans.x = i;
             ans.y = l + 1;
             return ans;
@@ -121,10 +153,11 @@ Point getLStart() {
 static int16 getRIndexStart(int16 i) {
     int16 l, r, m;
     l = i < BODY_ROW ? halfW : HIDE_COL_R;
-    r = 186 - halfBlock;
+    /* 右界收到裁切框内侧，理由同 getLIndexStart */
+    r = VIEW_COL_R - halfBlock;
     while (l < r) {
         m = (l + r + 1) >> 1;
-        if (mt9v03x_frame[i][m] < RThreshold && mt9v03x_frame[i][func_min(187, m + 8)] < RThreshold && mt9v03x_frame[i][func_min(187, m + 25)] < RThreshold) r = m - 1;
+        if (mt9v03x_frame[i][m] < RThreshold && mt9v03x_frame[i][func_min(MT9V03X_W - 1, m + 8)] < RThreshold && mt9v03x_frame[i][func_min(MT9V03X_W - 1, m + 25)] < RThreshold) r = m - 1;
         else l = m;
     }
     return r;
@@ -133,7 +166,8 @@ static int16 getRIndexStart(int16 i) {
 Point getRStart() {
     int16 i, r;
     Point ans;
-    for (i = MT9V03X_H - halfBlock - 2; i >= 70; i -= 3) {
+    /* 与 getLStart 一致：扫描范围就是视野窗口的行区间 */
+    for (i = VIEW_NEAR_ROW - halfBlock - 2; i >= VIEW_FAR_ROW + 3; i -= 3) {
         r = getRIndexStart(i);
         if (mt9v03x_frame[i][func_max(r - 2, 0)] > RThreshold && check(i, r)) {
             ans.x = i;
@@ -164,8 +198,12 @@ void getLBorder(Point LRoad[], Point start, int16 *count) {
     // 写入点数硬夹在数组容量内：调用方误传负 count 时不会越界写 LRoad[]
     limit = func_limit_ab(*count, 0, expRoadCount);
     tempThreshold = localThreshold = getPointThreshold(x, y);
-    while (x > halfBlock + 1 && x < MT9V03X_H - halfBlock - 1 && y > halfBlock + 1 && y < MT9V03X_W - halfBlock - 1 && step < limit &&
-           turn < 4) {
+    /* 爬线活动范围限制在视野窗口内：窗口外是写成暗区的区域，
+     * 走进去只会被当成"前方变暗"而反复转向，白白消耗 turn 配额 */
+    /* turn 上限 8：原来 4 次就放弃，硬弯内侧边线是斜的、常需要连续几次转向，
+     * 提前截断会让点数骤降，与"真实缺口"混在一起，是元素误判的主要噪声源。 */
+    while (x > VIEW_FAR_ROW + 1 && x < VIEW_NEAR_ROW - 1 && y > VIEW_COL_L + 1 && y < VIEW_COL_R - 1 && step < limit &&
+           turn < 8) {
         up++;
         if (up == 2) {
             localThreshold = getPointThreshold(x, y);
@@ -193,9 +231,26 @@ void getLBorder(Point LRoad[], Point start, int16 *count) {
         if (x == start.x && y == start.y && !turn) break;
     }
     *count = step;
-    if (step > 25 && !banUpdateThreshold) {
-        LThreshold = (int16) tempThreshold + (int16) LThreshold >> 1;
-        threshold = (int16) LThreshold + (int16) RThreshold >> 1;
+    /* 阈值更新不允许被"爬线成功"单方面锁死：光照突变 → 画面整体偏暗 → 爬线失败
+     * （step 很小）→ 阈值不再更新 → 下一帧更失败——正反馈死锁，停死后按键也无法恢复。
+     * 爬线失败时用全帧 min/max 中点做一次 1/4 权重的弱拉回，让阈值缓慢跟随环境；
+     * 成功路径（step > 25）仍走原来的算术平均。十字补线期间 banUpdateThreshold 照旧冻结。 */
+    if (!banUpdateThreshold) {
+        if (step > 25) {
+            /* 阈值平滑：取「本次局部阈值」与「上一帧阈值」的算术平均。
+             * 先把两个操作数提升到 int16 再相加，避免 int8 中间结果溢出。
+             * 括号只是把 C 的优先级（+ 高于 >>）写明白，语义与参考实现一致。 */
+            LThreshold = (uint8) (((int16) tempThreshold + (int16) LThreshold) >> 1);
+            threshold = (uint8) (((int16) LThreshold + (int16) RThreshold) >> 1);
+        } else if (step < 5) {
+            /* 只在"几乎一个点都没爬出来"时才兜底：这才是阈值死锁的症状。
+             * 原来条件写成 step <= 25，但急弯 / 环岛 / 十字里单侧可见点数本来就只有
+             * 十几到二十几个，会每帧都命中，把局部自适应阈值一路拉向全帧中点。 */
+            uint8 re = imageInitThreshold();
+            LThreshold = (uint8) (((int16) re + 3 * (int16) LThreshold) >> 2);
+            RThreshold = (uint8) (((int16) re + 3 * (int16) RThreshold) >> 2);
+            threshold = (uint8) (((int16) LThreshold + (int16) RThreshold) >> 1);
+        }
     }
     // 阈值冻结标志由 crossReset()/elementReset() 统一解除，爬线函数不再自己清，
     // 否则同帧的 getLBorder 清掉后 getRBorder 又会更新，十字期间冻结失效
@@ -218,8 +273,9 @@ void getRBorder(Point RRoad[], Point start, int16 *count) {
     }
     limit = func_limit_ab(*count, 0, expRoadCount);
     tempThreshold = localThreshold = getPointThreshold(x, y);
-    while (x > halfBlock + 1 && x < 119 - halfBlock && y > halfBlock + 1 && y < 187 - halfBlock && step < limit &&
-           turn < 4) {
+    /* 与 getLBorder 对称：活动范围限制在窗口内，turn 上限同步放宽到 8 */
+    while (x > VIEW_FAR_ROW + 1 && x < VIEW_NEAR_ROW - 1 && y > VIEW_COL_L + 1 && y < VIEW_COL_R - 1 && step < limit &&
+           turn < 8) {
         up++;
         if (up == 2) {
             localThreshold = getPointThreshold(x, y);
@@ -247,9 +303,15 @@ void getRBorder(Point RRoad[], Point start, int16 *count) {
         if (x == start.x && y == start.y && !turn) break;
     }
     *count = step;
-    if (step > 25 && !banUpdateThreshold) {
-        RThreshold = (int16) tempThreshold + (int16) RThreshold >> 1;
-        threshold = (int16) LThreshold + (int16) RThreshold >> 1;
+    /* 与 getLBorder 一致：成功走算术平均；失败时不再重复做全帧重估——
+     * 同帧内 getLBorder 已经按 1/4 权重拉过一次，这里只把合成阈值刷新一下，
+     * 避免失败帧每侧各扫 2296 点（2 次/帧 → 1 次/帧）。 */
+    if (!banUpdateThreshold) {
+        if (step > 25) {
+            /* 阈值平滑：与 getLBorder 一致，先提升到 int16 再取算术平均 */
+            RThreshold = (uint8) (((int16) tempThreshold + (int16) RThreshold) >> 1);
+        }
+        threshold = (uint8) (((int16) LThreshold + (int16) RThreshold) >> 1);
     }
     // 阈值冻结标志由 crossReset()/elementReset() 统一解除，爬线函数不再自己清，
     // 否则同帧的 getLBorder 清掉后 getRBorder 又会更新，十字期间冻结失效
@@ -274,7 +336,13 @@ void getCenterLineByLBorder(Point roadLine[], Point centerLine[], int16 count) {
         dy = roadLine[idx2].y - roadLine[idx1].y;
         // C251 的 int 为 16 位：dy² 可达 187² > 32767，必须先提升到 int32
         dn = (int16) sqrt_int((int32) dx * dx + (int32) dy * dy);
-        if (!dn) continue;
+        if (!dn) {
+            /* 重采样可能出现重复点：直接沿用前一个中线点。
+             * 原来 continue 会跳过赋值，centerLine[i] 保留数组上一帧的残值（幽灵点），
+             * 经 filterRoad 平滑后向下游扩散。 */
+            centerLine[i] = centerLine[i - 1];
+            continue;
+        }
         center_x = roadLine[i].x + (dy * centerLineDistance) / dn;
         center_y = roadLine[i].y - (dx * centerLineDistance) / dn;
         centerLine[i].x = func_limit_ab(center_x, 0, MT9V03X_H - 1);
@@ -300,7 +368,10 @@ void getCenterLineByRBorder(Point roadLine[], Point centerLine[], int16 count) {
         dx = roadLine[idx2].x - roadLine[idx1].x;
         dy = roadLine[idx2].y - roadLine[idx1].y;
         dn = (int16) sqrt_int((int32) dx * dx + (int32) dy * dy);
-        if (!dn) continue;
+        if (!dn) {
+            centerLine[i] = centerLine[i - 1];   // 同 getCenterLineByLBorder：不留上一帧残值
+            continue;
+        }
         center_x = roadLine[i].x - (dy * centerLineDistance) / dn;
         center_y = roadLine[i].y + (dx * centerLineDistance) / dn;
         centerLine[i].x = func_limit_ab(center_x, 0, MT9V03X_H - 1);
@@ -321,6 +392,7 @@ void filterRoad(Point rodeLine[], int16 count) {
 }
 
 void getGodRoadLine(Point roadLine[], int16 count) {
+#if USE_REFLECTION
     int16 data i;
     uint8 data px, data py;
     for (i = 0; i < count && i < expRoadCount; i++) {
@@ -331,6 +403,12 @@ void getGodRoadLine(Point roadLine[], int16 count) {
         roadLine[i].x = reflection[px][py][0];
         roadLine[i].y = reflection[px][py][1];
     }
+#else
+    /* 旁路查表：表按 25 cm / 39° 标定，当前 20 cm / 45° 透视已变，
+     * 查表会把中线整体拉偏。这里保留原始斜视坐标，
+     * 纯跟踪的 dx / dy 仍按同一套像素坐标计算，只是几何不再是上帝视角。 */
+    if (count <= 0 || roadLine == 0) return;
+#endif
 }
 
 void resampleRoad(Point roadLine[], int16 *count, int16 startPos, uint8 dis) {
@@ -362,7 +440,7 @@ void resampleRoad(Point roadLine[], int16 *count, int16 startPos, uint8 dis) {
             cx = (int16) (tx / len);
             cy = (int16) (ty / len);
             output[step].x = func_limit_ab(cx, 0, MT9V03X_H - 1);
-            output[step].y = func_limit_ab(cy, 0, 187);
+            output[step].y = func_limit_ab(cy, 0, MT9V03X_W - 1);
             step++;
             remain += dis;
         }
@@ -377,11 +455,14 @@ void resampleRoad(Point roadLine[], int16 *count, int16 startPos, uint8 dis) {
 }
 
 int16 findCorner(Point roadLine[], int16 count, int8 cross) {
-    volatile int16 data i;
+    /* 局部变量不加 volatile：这里没有中断共享，加 volatile 会强制 C251 每步都回到
+     * 内存访存，而这个函数是逐点开方的访存密集区。保留 data 段修饰即可。 */
+    int16 data i;
     int16 data p = 0, data c = 0;
     int32 data m = 0;   // 100*abs_dot 远超 int8，原来被截断导致"最尖拐点"分支永不生效
-    for (i = 3; i < count - 2 && roadLine[i].x > 20; i++) {
-        volatile int32 i_5 = func_limit_ab(i - 5, 0, count - 1), i0 = func_limit_ab(i, 0, count - 1),
+    /* 拐点只在窗口内搜索：点列走到窗口远端行就该停，继续往上是暗区 */
+    for (i = 3; i < count - 2 && roadLine[i].x > VIEW_FAR_ROW; i++) {
+        int32 i_5 = func_limit_ab(i - 5, 0, count - 1), i0 = func_limit_ab(i, 0, count - 1),
         i5 = func_limit_ab(i + (cross ? 5 : 2), 0, count - 1), dx1 = roadLine[i0].x - roadLine[i_5].x,
         dy1 = roadLine[i0].y - roadLine[i_5].y, dx2 = roadLine[i5].x - roadLine[i0].x,
         dy2 = roadLine[i5].y - roadLine[i0].y, len1_sq = dx1 * dx1 + dy1 * dy1,
@@ -410,6 +491,8 @@ int16 findCorner(Point roadLine[], int16 count, int8 cross) {
 // 调试显示函数已移除：为给摄像头双缓冲腾出 XRAM，删除了依赖 outputImage(22.5KB) 的显示功能。
 // 需要预览原始画面时，可直接调用 ips200_displayimage03x(mt9v03x_frame, MT9V03X_W, MT9V03X_H, 0, 0)。
 
+/* 45 KB 标定表：USE_REFLECTION = 0 时整块裁掉，不占 Flash */
+#if USE_REFLECTION
 const uint8 reflection[120][188][2] = {
         0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -2668,4 +2751,5 @@ const uint8 reflection[120][188][2] = {
 119,112,119,113,119,113,119,113,119,113,119,114,119,114,119,114,119,114,119,114,
 119,115,119,115,119,115,119,115,119,116,119,116,119,116,119,116,119,117
 };
+#endif  // USE_REFLECTION
 

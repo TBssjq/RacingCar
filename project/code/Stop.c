@@ -61,9 +61,12 @@ void raceStart(void) {
     handle = 0;
     enableDifSpeed = 1;
     gpio_set_level(IO_P90, 0);
-    motorKickStart(); // 起跑助推：先固定占空比推 300 ms，破静摩擦后再交给 PID
     raceState = RACE_RUNNING;
+    /* 顺序不能反：PIT 的停车分支末尾会清 kickCnt，若先 motorKickStart() 再 stop=0，
+     * 第一拍 5 ms 就把助推清零，助推完全失效。当前 MOTOR_KICK_TICKS = 0 掩盖了这个缺陷，
+     * 一旦把助推调回非零（例如 300 ms）就会暴露。 */
     stop = 0;
+    motorKickStart(); // 起跑助推：先固定占空比推 300 ms，破静摩擦后再交给 PID
 }
 
 void raceSetLap(void) {

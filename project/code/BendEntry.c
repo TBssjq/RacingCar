@@ -66,10 +66,13 @@ static void bendEntryCalc(Point cl[], int16 cc, int16 aimPos, int8 *turn, int16 
     farPos = func_limit_ab(pos + BE_FAR_AHEAD, pos, cc - 1);
     dyFar = (int16) (94 - (int16) cl[farPos].y);
     dy = (int16) (dyAim + (dyFar - dyAim) / BE_FEED_DIV);
-    dx = MT9V03X_H - cl[pos].x + BE_DEVICE_H;
+    dx = STEER_REF_ROW - cl[pos].x + BE_DEVICE_H;
+    if (dx < BE_DX_MIN) dx = BE_DX_MIN;   // 与 Motor.c 的 PP_DX_MIN 保持一致
+    /* dx 已夹到 ≥ BE_DX_MIN，ax ≥ BE_DX_MIN² 恒成立，不必再判 ax > 0
+     * （原来的 else 分支——d 保持 0——数学上永远走不到） */
     ay = (int32) 2 * BE_DEVICE_H * dy;
     ax = (int32) dx * dx + (int32) dy * dy;
-    if (ax > 0) d = (int8) atan2_int(ay, ax);
+    d = (int8) atan2_int(ay, ax);
 
     *turn = d;
     *bend = (int16) (func_abs((int16) (dyFar - dyAim)) + func_abs((int16) d));
@@ -111,6 +114,11 @@ void bendEntryUpdate(Point centerLine[], int16 centerLineCount, int16 aimPos) {
             beLostMs = 0;
             if (func_abs((int16) d) >= BE_TURN_MIN) beHoldTurn = d;
         } else if (bend < BE_BEND_EXIT) {
+            beState = BE_STRAIGHT;
+        } else if ((uint16) (msTick - beStateMs) > BE_MAX_APPROACH_MS) {
+            /* 强度在 4~10 之间来回抖动时，APPROACH 可能长期不退出。
+             * 加超时兜底：超过 BE_MAX_APPROACH_MS 还没拿到丢边信号就回直道，
+             * 避免状态机长期停在"预备入弯"。 */
             beState = BE_STRAIGHT;
         }
         break;

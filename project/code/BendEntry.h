@@ -31,7 +31,9 @@
  * 进入 COMMITTED 后，画面里没有边界是正常现象，不能按"冲出赛道"处理。 */
 #define BE_BLANK_MS             250   // 完全免判出界的时间窗（毫秒）
 #define BE_MAX_LOST_MS          900   // 连接处最长容忍时间；大转弯幅度的弯道视觉丢失时间明显更长
+#define BE_MAX_APPROACH_MS      400   // 预备入弯的最长停留时间：强度抖动时兜底回直道
 #define BE_RECOVER_POINTS       15    // 两侧点数都超过该值才认为重新看到赛道
+#define BE_DX_MIN               30    // 纵向距离下限，与 Motor.h 的 PP_DX_MIN 保持一致
 
 /* ===== 转角保持 =====
  * 中线点数少到无法解算时，用最近一次有效转角维持转向，按帧衰减。 */
@@ -48,9 +50,10 @@ void bendEntryInit(void);
 void bendEntryUpdate(Point centerLine[], int16 centerLineCount, int16 aimPos);
 
 /* 出界宽容等级，供 main.c 的出界判定分支使用：
- *   0 = 正常判据（5 点全暗，或两侧无边界且至少 3 点暗）
- *   1 = 放宽（只有 5 点全暗才判）
- *   2 = 免判（连接处的时间窗内一律不判） */
+ *   0 = 正常判据（5 点全暗 + 200 ms 未见赛道 + 连续 3 帧）
+ *   1 = 与 0 相同（保留等级语义；main.c 只对 >= 2 做特殊处理）
+ *   2 = 免判（连接处 BE_BLANK_MS 时间窗内一律不判）
+ * 注意：APPROACH 状态返回 1，不等于"放宽"，不会抑制出界保护。 */
 uint8 bendEntryGuard(void);
 
 /* 转角保持。返回 1 表示本帧应使用 *turn 而不是纯跟踪结果；

@@ -13,10 +13,10 @@ volatile int16 encoderL, encoderR, setSpeed = 0, handle = 0, duty = 0;
 volatile int16 desiredSpeed = 0;
 volatile uint16 msTick = 0;
 volatile uint8 outOfTrack = 0;
-const int16 tani[33];
+const int16 tani[31];        // 索引域 0~30：atan2_int 的返回值上限就是 ±30
 extern uint8 switch1;             // 仅 DEBUG_MODE=1 的画面叠加使用
 extern volatile uint8 borderIn;
-static uint8 DEVICE_H = 18;
+static uint8 DEVICE_H = PP_LOOKAHEAD_PX;   // 初值即纯跟踪等效轴距，motorInit 可覆盖
 volatile int8 stop;
 int16 c1, c3, c4, c5; //仅保留实际参与运算的整定参数
 volatile int16 R, LSetSpeed, RSetSpeed, enableDifSpeed = 1;
@@ -304,12 +304,75 @@ static void pitHandler() {
 
 /* 本帧的弯道减速比例，100 = 不减速。由 alongLine() 计算、setServoDuty() 消费一次。
  * 元素状态机也走 alongLine()，所以减速在十字与环岛阶段同样生效。
- * bendHold 记住本次弯道里出现过的最严比例，弯心两端都偏、bend 收窄时不会中途加速。 */
+ * 多帧记忆在 bendHold：它记住本次弯道里出现过的最严比例，弯心两端都偏、
+ * bend 收窄时不会中途加速；bendBrake 只是"本帧给 setServoDuty 的快照"，
+ * 后者读完立刻把它复位成 100，所以看起来像单帧量——真正的记忆别去 bendBrake 里找。 */
 static uint8 bendBrake = 100;
 static uint8 bendHold = 100;
 
+/* 本帧前瞻点所在行，只给串口 AIM 字段观测用：
+ * 两种取法（PP_ARC_MODE）切换后，靠它确认同一弯道的前瞻行不再随中线点数跳。 */
+int16 aimRowDbg = 0;
+
+#if (PP_ARC_MODE)
+/* 沿中线累计弧长取两个点：aim 在 aimArc 处（线不够长就退到最后一个点，
+ * 前瞻点始终落在中线上、不外推到画面外），far 再远 BEND_FAR_AHEAD 个点距。
+ * far 允许沿末端切线外推最多 PP_ARC_EXT_MAX 像素：短线时若让 far 也退到线末，
+ * dyFar 会等于 dyAim，弯道前馈直接变成 0，等于把这条通路关掉。 */
+/* 注意形参名不能叫 far：C251 里 far / near / data / xdata 都是内存空间关键字。 */
+static void alongAimPoints(Point line[], int16 count, int16 aimArc, Point *aimPt, Point *farPt) {
+    int16 i, acc, dn, rem, farArc, sx, sy;
+    int16 lastSx = 0, lastSy = 0, lastDn = 0;
+    uint8 gotAim = 0, gotFar = 0;
+
+    *aimPt = line[0];
+    *farPt = line[0];
+    farArc = (int16) (aimArc + BEND_FAR_AHEAD * 2);
+    acc = 0;
+    for (i = 1; i < count; i++) {
+        sx = (int16) line[i].x - (int16) line[i - 1].x;
+        sy = (int16) line[i].y - (int16) line[i - 1].y;
+        dn = (int16) sqrt_int((int32) sx * sx + (int32) sy * sy);
+        if (!dn) continue;                       // 重采样可能有重复点
+        if (!gotAim && acc + dn >= aimArc) {
+            rem = (int16) (aimArc - acc);
+            aimPt->x = (uint8) ((int16) line[i - 1].x + (int16) ((int32) sx * rem / dn));
+            aimPt->y = (uint8) ((int16) line[i - 1].y + (int16) ((int32) sy * rem / dn));
+            gotAim = 1;
+        }
+        if (acc + dn >= farArc) {
+            rem = (int16) (farArc - acc);
+            farPt->x = (uint8) ((int16) line[i - 1].x + (int16) ((int32) sx * rem / dn));
+            farPt->y = (uint8) ((int16) line[i - 1].y + (int16) ((int32) sy * rem / dn));
+            gotFar = 1;
+            break;
+        }
+        acc = (int16) (acc + dn);
+        lastSx = sx;
+        lastSy = sy;
+        lastDn = dn;
+    }
+    if (!gotFar) {
+        /* 线不够长：从 aim 点沿末端切线外推。
+         * 已经取到 aim 时剩下的距离恒为 BEND_FAR_AHEAD×2，不必再算累计弧长。 */
+        if (!gotAim) *aimPt = line[count - 1];
+        rem = gotAim ? (int16) (BEND_FAR_AHEAD * 2) : (int16) (farArc - acc);
+        if (rem > PP_ARC_EXT_MAX) rem = PP_ARC_EXT_MAX;
+        if (lastDn) {
+            farPt->x = (uint8) func_limit_ab((int32) aimPt->x + (int32) lastSx * rem / lastDn,
+                                             0, MT9V03X_H - 1);
+            farPt->y = (uint8) func_limit_ab((int32) aimPt->y + (int32) lastSy * rem / lastDn,
+                                             0, MT9V03X_W - 1);
+        } else {
+            *farPt = *aimPt;
+        }
+    }
+}
+#endif
+
 void alongLine(Point roadLine[], int16 count, int16 aimPos) {
-    int16 pos, farPos, dx, dy, dyAim, dyFar, bend, ratio;
+    int16 pos, dx, dy, dyAim, dyFar, bend, ratio;
+    int16 aimRow, aimCol;
     int32 ax, ay;
     int8 d;
     /* 原来要求 count > 5，弯道被拐点截断后只剩几个点就直接返回、保持上一拍打角。
@@ -319,25 +382,46 @@ void alongLine(Point roadLine[], int16 count, int16 aimPos) {
         return;
     }
     pos = func_limit_ab(aimPos, 2, count - 1);
+#if (PP_ARC_MODE)
+    /* 弧长取点：pos 只当作"目标弧长 = pos×2 像素"的索引，不再被中线长度夹逼。
+     * 线短时由 alongAimPoints() 沿切线外推，前瞻距离与打角增益都不随点数变化。 */
+    {
+        Point aimPt, farPt;
+        alongAimPoints(roadLine, count, (int16) (pos * 2), &aimPt, &farPt);
+        aimRow = (int16) aimPt.x;
+        aimCol = (int16) aimPt.y;
+        dyAim = (int16) (94 - aimCol);
+        dyFar = (int16) (94 - (int16) farPt.y);
+    }
+#else
     /* 给远端趋势留出采样余量：前瞻点贴到中线末端时远端点与它重合，
-     * 前馈会退化成 0，弯道深处反而失去提前量。 */
+     * 前馈会退化成 0，弯道深处反而失去提前量。
+     * 代价是线短时 pos 被压到 count-1-BEND_FAR_AHEAD，前瞻点往车头缩
+     * （见 Motor.h 的 PP_ARC_MODE，那是另一种取法）。 */
     if (count > BEND_FAR_AHEAD + 3)
         pos = func_limit_ab(pos, 2, count - 1 - BEND_FAR_AHEAD);
-    dyAim = (int16) (94 - (int16) roadLine[pos].y);
-    farPos = func_limit_ab(pos + BEND_FAR_AHEAD, pos, count - 1);
-    dyFar = (int16) (94 - (int16) roadLine[farPos].y);
+    aimRow = (int16) roadLine[pos].x;
+    aimCol = (int16) roadLine[pos].y;
+    dyAim = (int16) (94 - aimCol);
+    {
+        int16 farPos = func_limit_ab(pos + BEND_FAR_AHEAD, pos, count - 1);
+        dyFar = (int16) (94 - (int16) roadLine[farPos].y);
+    }
+#endif
+    aimRowDbg = aimRow;
     /* TRACK_BIAS_PX：摄像头装偏或支架倾斜时，画面中心列对应的不是车头正前方，
      * 横向偏差里带一个恒定分量，纯跟踪只能靠稳态偏差去抵消，表现就是车贴着一侧跑。
      * 偏置直接加在最终偏差上，直道与弯道同时生效。 */
     dy = (int16) (dyAim + (dyFar - dyAim) / BEND_FEED_DIV + TRACK_BIAS_PX);
-    dx = MT9V03X_H - roadLine[pos].x + DEVICE_H;
-    // 16 位平方会溢出；dx=dy=0 时 atan2 会打满舵，这里直接保持上一拍打角
+    dx = STEER_REF_ROW - aimRow + DEVICE_H;
+    /* 前瞻点贴到车头行时 dx 会掉到 18 以下，atan 直接打满舵；给一个下限兜住。
+     * 十字补线终点落在车头行、被截短的中线都可能触发这种极端几何。 */
+    if (dx < PP_DX_MIN) dx = PP_DX_MIN;
+    /* 16 位平方会溢出，必须先提升到 32 位。
+     * dx 上面已经夹到 ≥ PP_DX_MIN，所以 ax ≥ PP_DX_MIN² = 900 恒成立，
+     * 不需要再判 ax <= 0（那个分支数学上不可达，只会让人以为存在 dx=0 的路径）。 */
     ay = (int32) 2 * DEVICE_H * dy;
     ax = (int32) dx * dx + (int32) dy * dy;
-    if (ax <= 0) {
-        bendBrake = bendHold = 100;
-        return;
-    }
     d = (int8) atan2_int(ay, ax);
     /* 弯道强度：远端趋势变化量 + 当前转角。
      * 前瞻点还在直道、远端已进弯时前一项先起作用，减速比 borderIn 早得多；
@@ -368,7 +452,7 @@ void alongLine(Point roadLine[], int16 count, int16 aimPos) {
     }
 #if (DEBUG_MODE)
     if (switch1)
-        ips200_draw_point(roadLine[pos].y, roadLine[pos].x + MT9V03X_H + 40, RGB565_RED);
+        ips200_draw_point(aimCol, aimRow + MT9V03X_H + 40, RGB565_RED);
 #endif
     setServoDuty(d);
 }
@@ -391,8 +475,9 @@ void setServoDuty(int8 d) {
 #endif
     /* 曲率限速的 tan 表索引是「角度本身」，不是放大后的 duty。
      * 原来用 currentDuty 查表，d 一过 13 就固定查 tan(32°)，
-     * 不同弯道算出的限速完全一样，曲率限速等于没接上。 */
-    t = tani[func_limit_ab(func_abs(d), 0, 32)];
+     * 不同弯道算出的限速完全一样，曲率限速等于没接上。
+     * 索引直接取 |d|：上面已把 d 夹到 ±30，表长也是 31，不需要再夹一次。 */
+    t = tani[func_abs(d)];
     r = !t ? 0 : 20000 / t;
     ts = c5;
     // c4 是有符号标定参数，不能用 uint32 强转；sqrt_int 已支持 int32 全域。
@@ -422,7 +507,9 @@ int8 getAimPos() {
      * 中线重采样间距 2 像素，c3 = 24 即约 48 像素前瞻；
      * currentSpeed 是「脉冲 / 5 ms」，满速 400 时额外加 10 个点（约 20 像素）。 */
     int16 aim = (int16) c3 + (int16) (currentSpeed / 40);
-    return (int8) func_limit_ab(aim, c3, c3 + 20);
+    /* 上限按速度天花板推导：SPEED_LIMIT / 40 = 10，满速时正好用满。
+     * 原来写死 c3 + 20，要 800 脉冲 / 5 ms 才顶得到，等于恒不生效。 */
+    return (int8) func_limit_ab(aim, c3, c3 + SPEED_LIMIT / 40);
 }
 
 /* 强制停车：直接把两路占空比清零、取消助推，不依赖 PID 状态。
@@ -442,26 +529,27 @@ void motorKickStart(void) {
     rampDuty = MOTOR_RAMP_START;
 }
 
-/* 上电舵机自检：机械中位 → 一侧 30° → 另一侧 30° → 回机械中位，全程约 1.4 s。
+/* 上电舵机自检：机械中位 → 一侧 30° → 另一侧 30° → 回机械中位，全程约 1.5 s。
  * 用来确认舵机供电、信号线、机械行程是否正常；电机完全不参与。
  * 中心取 steerMid + STEER_TRIM：舵机装偏时电信号中位对应不到机械 90°，
- * 用这个值摆动，结束后停下的位置就是车轮正中。 */
+ * 用这个值摆动，结束后停下的位置就是车轮正中。
+ * 步长必须整除摆幅（见 Motor.h 的 SERVO_TEST_STEP），否则三段都停不到端点上。 */
 void servoSelfTest(void) {
     int16 i;
     int16 center = (int16) (steerMid + STEER_TRIM);
     servoTestBusy = 1;                 // 自检期间独占舵机，控制中断不再写中值
     pwm_init(PWME_CH3P_PA4, 200, center);
     system_delay_ms(200);
-    for (i = 0; i <= SERVO_TEST_SWING; i += 25) { // 机械中位 → 一端
-        pwm_set_duty(PWME_CH3P_PA4, center - i);
+    for (i = 0; i <= SERVO_TEST_SWING; i += SERVO_TEST_STEP) { // 机械中位 → 一端
+        pwm_set_duty(PWME_CH3P_PA4, (uint16) (center - i));
         system_delay_ms(20);
     }
-    for (i = SERVO_TEST_SWING; i >= -SERVO_TEST_SWING; i -= 25) { // → 另一端
-        pwm_set_duty(PWME_CH3P_PA4, center - i);
+    for (i = SERVO_TEST_SWING; i >= -SERVO_TEST_SWING; i -= SERVO_TEST_STEP) { // → 另一端
+        pwm_set_duty(PWME_CH3P_PA4, (uint16) (center - i));
         system_delay_ms(20);
     }
-    for (i = -SERVO_TEST_SWING; i <= 0; i += 25) { // 回机械中位
-        pwm_set_duty(PWME_CH3P_PA4, center - i);
+    for (i = -SERVO_TEST_SWING; i <= 0; i += SERVO_TEST_STEP) { // 回机械中位
+        pwm_set_duty(PWME_CH3P_PA4, (uint16) (center - i));
         system_delay_ms(20);
     }
     servoTestBusy = 0;
@@ -495,10 +583,12 @@ void motorInit(int16 c11, int16 c33, int16 c44, int16 c55, int16 c77) {
     pit_ms_init(TIM1_PIT, 5, pitHandler);
 }
 
-const int16 tani[33] = {0,
+/* tan(角度) × 1000，索引就是图像角度。只到 30 度：atan2_int() 的返回值上限是 ±30，
+ * alongLine() 与 setServoDuty() 又各自夹过一次，原表的 31、32 两档永远用不到。 */
+const int16 tani[31] = {0,
                         17,  35,  52,  70,  87,  105, 123, 141, 158, 176,
                         194, 213, 231, 249, 268, 287, 306, 325, 344, 364,
-                        384, 404, 424, 445, 466, 488, 510, 532, 554, 577, 600, 628};
+                        384, 404, 424, 445, 466, 488, 510, 532, 554, 577};
 
 void controlReset(void) {
     // 发车/急停时清空 PID 历史，避免上一次的积分与误差继续作用
