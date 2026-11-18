@@ -314,6 +314,11 @@ static uint8 bendHold = 100;
  * 两种取法（PP_ARC_MODE）切换后，靠它确认同一弯道的前瞻行不再随中线点数跳。 */
 int16 aimRowDbg = 0;
 
+/* 元素模块的三个输出量（见 Motor.h）。默认值 = 不干预。 */
+int8  elemSteerBiasDeg = 0;
+uint8 elemSpeedRatio = 100;
+int8  lastSteerDeg = 0;
+
 #if (PP_ARC_MODE)
 /* 沿中线累计弧长取两个点：aim 在 aimArc 处（线不够长就退到最后一个点，
  * 前瞻点始终落在中线上、不外推到画面外），far 再远 BEND_FAR_AHEAD 个点距。
@@ -458,13 +463,26 @@ void alongLine(Point roadLine[], int16 count, int16 aimPos) {
 }
 
 void setServoDuty(int8 d) {
-    int16 data t, r, ts, slow;
+    /* 注意：变量名不能叫 cap —— C251 里 cap 是保留字（和 far / near / data 同类），
+     * 写成 int16 cap 会报 "syntax error near '4'"，错误位置还指在别的行上，很难查。 */
+    int16 data t, r, ts, slow, speedCap;
     int32 data v;
     /* 减速量只消费一次：元素函数若直接调用本函数，不会残留上一帧的弯道比例 */
     slow = (int16) bendBrake;
     bendBrake = 100;
+    /* BEND_SPEED_CAP(200) 只是"弯道减速刚起步时别以直道速度冲进弯"的兜底，
+     * 只该跟弯道减速那一路绑定。以前它对所有 slow < 100 的情况都生效，
+     * 结果元素模块按比例压出来的速度又被统一砍到 200：
+     * S 弯想跑 70%（280）会变成 200，十字 60%（240）也变成 200，
+     * 三个模块的比例参数实际上只有"要不要触发 200 上限"这一个含义。
+     * 现在把 cap 绑在 bendBrake 上，元素比例按原本的百分比走。 */
+    speedCap = (slow < 100) ? BEND_SPEED_CAP : 0x7FFF;
     if (borderIn && BORDER_IN_SPEED_RATIO < slow) slow = BORDER_IN_SPEED_RATIO;
+    /* 元素模块的速度比例（环岛 50、十字路口 60、S 弯 70）：与 borderIn 取更严者，
+     * 不做连乘，避免两个限速叠成 25% 把车拖停。 */
+    if (elemSpeedRatio < slow) slow = elemSpeedRatio;
     d = (int8) func_limit(d, 30);
+    lastSteerDeg = d;      // 十字路口用它做"保持进入时的朝向"
     /* 舵机目标偏移：每 1 度图像角度对应 c1 / STEER_DUTY_DIV 个 duty，
      * 打满 30 度得到 390 duty，正好落在 STEER_DUTY_LIMIT 以内。
      * 转向量与横向偏差保持线性，弯道里有比例可言。 */
@@ -490,7 +508,7 @@ void setServoDuty(int8 d) {
          * 那时比例还接近 100%，没有 cap 的话车会以接近直道的速度冲进弯。 */
         if (slow < 100) {
             target = (int16) ((int32) target * slow / 100);
-            target = (int16) func_min(target, BEND_SPEED_CAP);
+            target = (int16) func_min(target, speedCap);   // 只有弯道减速那一路有 200 硬顶
         }
 #if (LOW_SPEED_TEST)
         target = (int16) func_min(target, LOW_SPEED_TEST_CAP);

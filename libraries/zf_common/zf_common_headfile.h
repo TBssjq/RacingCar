@@ -108,12 +108,13 @@
 
 #include "seekfree_assistant_interface.h"
 
-#include "Cross.h"
 #include "Image.h"
-#include "LRound.h"
-#include "RRound.h"
 #include "Motor.h"
 #include "Stop.h"
 #include "Track.h"
+/* 三个元素模块（各自独立：S 弯 / 环岛 / 十字形环岛） */
+#include "SCurve.h"
+#include "Round.h"
+#include "XCross.h"
 
 #endif

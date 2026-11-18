@@ -895,34 +895,34 @@
               <FilePath>..\code\Stop.h</FilePath>
             </File>
             <File>
-              <FileName>Cross.c</FileName>
+              <FileName>SCurve.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\code\Cross.c</FilePath>
+              <FilePath>..\code\SCurve.c</FilePath>
             </File>
             <File>
-              <FileName>Cross.h</FileName>
+              <FileName>SCurve.h</FileName>
               <FileType>5</FileType>
-              <FilePath>..\code\Cross.h</FilePath>
+              <FilePath>..\code\SCurve.h</FilePath>
             </File>
             <File>
-              <FileName>RRound.c</FileName>
+              <FileName>Round.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\code\RRound.c</FilePath>
+              <FilePath>..\code\Round.c</FilePath>
             </File>
             <File>
-              <FileName>RRound.h</FileName>
+              <FileName>Round.h</FileName>
               <FileType>5</FileType>
-              <FilePath>..\code\RRound.h</FilePath>
+              <FilePath>..\code\Round.h</FilePath>
             </File>
             <File>
-              <FileName>LRound.c</FileName>
+              <FileName>XCross.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\code\LRound.c</FilePath>
+              <FilePath>..\code\XCross.c</FilePath>
             </File>
             <File>
-              <FileName>LRound.h</FileName>
+              <FileName>XCross.h</FileName>
               <FileType>5</FileType>
-              <FilePath>..\code\LRound.h</FilePath>
+              <FilePath>..\code\XCross.h</FilePath>
             </File>
           </Files>
         </Group>

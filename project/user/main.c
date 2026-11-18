@@ -36,37 +36,13 @@
 #include "zf_common_headfile.h"
 #include "BendEntry.h"   // 弯道入口过渡区识别（独立模块，ENABLE_BEND_ENTRY 控制）
 
-/* 赛道元素开关 0=关闭 1=启用（先跑通纯循迹，再逐个打开调试） */
-#define ENABLE_CROSS 1
-#define ENABLE_ROUND 1
+/* 元素判据与流程已经全部搬到三个独立模块里：
+ *   第一部分 SCurve.c  连续 S 弯
+ *   第二部分 Round.c   环岛（左右共用，靠 side 区分）
+ *   第三部分 XCross.c  十字形环岛（X 路口）
+ * main.c 只负责"派发谁执行"与"总时长兜底"，不再持有任何元素阈值。 */
 
-/* ---- 元素识别判据（按当前视野窗口标定，改窗口必须重标） ----
- * 窗口行 10~99、重采样间距 3：直道单侧边界重采样后只有 21~28 点
- * （仿真：起点行 95 → 42 原始点 → 28；被车身挡到行 77 → 33 → 21）。
- * 因此**不能再按"第 37 个点"这种整幅画面的量级写判据**——37 > 28，
- * 数学上永远取不到，环岛入口会一直不触发。现在改成三条与窗口同尺度的条件：
- *   1. 外侧边界点数 > ROUND_MIN_PTS(16)：确实是一条健康的长边界；
- *   2. 外侧边界末点伸到 ROUND_FAR_ROW(VIEW_FAR_ROW+8) 以内：说明它是贴着
- *      赛道外侧一路伸向远端的直线，而不是在弯里从画面侧边拐出去的；
- *   3. 内侧边界短：被拐点裁短，或者整条丢失后只剩 0~2 点。
- * 换摄像头俯仰角、安装高度或窗口尺寸后，应实测 `L`/`R` 重新确定这三个值。 */
-#define ROUND_MIN_PTS   16    //外侧边界最少点数（直道约 21~28）
-/* 内侧边界点数量上限：取 4 而不是 11。环岛入口处内侧线是"整条消失"（重采样后 0~2 点），
- * 而普通弯道里内侧线只是被拐点裁短，通常还剩 3~5 点；门槛收紧后才能把两者分开。
- * 判据直接用 loadRoad() 输出的 LRoadCount / RRoadCount，不要额外要求"拐点非零"：
- * 有拐点时这两个数等于拐点序号（≥ 3），没有拐点时等于原始点数（0~2），两种情况都 < 4。
- * 一旦加上 LCorner / RCorner 非零，后者（内侧线整条消失，正是环岛入口的主要工况）
- * 就被排除掉了：LCorner 为 0 时 LRoadCount 就是原始点数 0~2，条件反而恒不成立，
- * 只剩"拐点恰好落在第 3 点"这一种能进，数学上几乎不可达。
- * 现场若发现入口触发偏晚，先把它加到 6 试。 */
-#define ROUND_FAR_MAX   4     //内侧边界点数量上限（短边界 = 缺口）
-#define ROUND_FAR_ROW   (VIEW_FAR_ROW + 8)   //外侧边界末点必须伸到该行以内
-#define CROSS_MAX       14    //十字判定：两侧边界点数上限（配合 Cross.h 的入口门槛）
-
-/* 元素超时：按"阶段"计时（RUN_MODE + 元素内部阶段），阶段一变就重置预算。
- * 原来五阶段共享一个 8 s，大环岛单圈超时会在圆周中途被强制复位。 */
-#define ELEM_TIMEOUT_MS     8000
-/* 总预算：阶段来回翻转时单阶段计时会被反复重置，这里再压一层总上限，
+/* 总预算：三个模块各自有单阶段超时，这里再压一层总上限，
  * 保证任何元素都不会无限占用。 */
 #define ELEM_TOTAL_MS       20000
 
@@ -109,18 +85,60 @@ int16 LRawCount = 0, RRawCount = 0;
  * 这里只置标志，真正的重估放到下一帧的 loadRoad() 里做。 */
 static uint8 threshReload = 0;
 static int16 borderInTriggerDistance = 25;
+
+/* ===== 元素仲裁：同一时刻只有一个模块在跑 =====
+ * 优先级 十字形环岛 > 环岛 > 连续 S 弯。占用期间其他模块的检测不执行，
+ * 所以不存在"一个元素触发另一个元素"的串扰。 */
+#define ELEM_NONE     0
+#define ELEM_SCURVE   1
+#define ELEM_ROUND    2
+#define ELEM_XCROSS   3
+static uint8 elemActive = ELEM_NONE;
+/* 串口可观测量（只写不参与控制） */
+static uint8 elemStageDbg = 0;   // 元素内部阶段
+static uint8 elemCandDbg = 0;    // 环岛入口候选位：bit0 右、bit1 左
+static uint8 roundScoreDbg = 0;  // 环岛入口积分进度（到 3 触发）
+
+/* ===== 黑匣子：跑车时记录元素状态，停车接上数据线再读 =====
+ * 现场限制：跑车时数据线不够长，只能停车后读串口。所以把关键状态按 20 Hz
+ * 记进 RAM（512 条 × 50 ms ≈ 25 s，够跑一整圈），停车后按 B3 回放。
+ * 每条的格式（逗号分隔，前缀 LOG）：
+ *   LOG  t,MODE,STG,CAND,RS,L,R,C,DUTY
+ * 看连续的 t 就能还原"进环岛那几秒到底发生了什么"。 */
+#define ELEM_LOG_N   512
+/* usb.h 里 DEVSTATE_CONFIGURED = 4，只有到这一步 USB 才真的能发数据 */
+#define USB_STATE_CONFIGURED   4
+typedef struct {
+    uint16 t;      // 相对发车时刻的毫秒（<65 s 不会回绕）
+    uint8  mode;   // RUN_MODE
+    uint8  stg;    // 元素内部阶段
+    uint8  cand;   // 环岛候选位
+    uint8  rs;     // 环岛积分
+    uint8  l;      // LRawCount（截到 255）
+    uint8  r;      // RRawCount
+    uint8  c;      // centerLineCount
+    int8   duty;   // 舵机偏移 / 4（压缩到 ±99，乘以 4 还原）
+} elemLog_t;
+
+static elemLog_t elemLog[ELEM_LOG_N];
+static uint16 logW = 0;         // 写指针（512 超过 uint8 范围）
+static uint16 logCount = 0;     // 有效条数
+static uint16 logStartMs = 0;    // 发车时刻，用于算相对时间
+static uint16 logLastMs = 0;     // 上次记录时刻
+static uint8  logDump = 0;       // 1 = 正在往外吐
+static uint16 logDumpIdx = 0;   // 吐到第几条
 volatile uint8 borderIn; //主循环写、中断读
 uint8 switch1, switch2, ALONG = ALONG_R;
 Point centerLine[expRoadCount], LRoad[expRoadCount], RRoad[expRoadCount];
 extern int16 currentDuty;
 extern int16 aimRowDbg;       // alongLine 本帧前瞻点行号，debugReport 的 AIM 字段
+/* USB 设备状态（usb.h 里是 extern BYTE DeviceState）。
+ * 只有等于 DEVSTATE_CONFIGURED(4) 时 usb_cdc_write_buffer 才会真正发送，
+ * 否则 printf 一个字节都出不去。这里手工声明，避免把整个 usb.h 拉进来。 */
+extern uint8 DeviceState;
 extern uint16 dropFrameCnt;   // Image.c 统计的丢帧数，debugReport 的 DROP 字段
 
-/* 元素内部阶段查询：只用于"按阶段重置超时预算"。
- * 三个头文件是 GBK 编码，这里直接前置声明，避免改头文件时把编码搅乱。 */
-uint8 crossStage(void);
-uint8 lroundStage(void);
-uint8 rroundStage(void);
+
 
 /* 8 组整定参数：{舵机增益 c1, 前瞻点序号 c3, 弯道限速系数 c4, 直道限速 c5}
  *   c1：每 1 度图像角度对应的舵机 duty = c1 / STEER_DUTY_DIV（见 Motor.h）
@@ -209,9 +227,10 @@ static void btnScan(void) {
 /* 发车/急停时统一复位：元素状态机、补线偏移、控制量与比赛相关全局量。
  * 只在 main.c 实现，由 Stop.c 的 raceStart()/stopInit() 调用。 */
 void elementReset(void) {
-    crossReset();
-    lroundReset();
-    rroundReset();
+    scReset();
+    rdReset();
+    xcReset();
+    elemActive = ELEM_NONE;
     controlReset();
     RUN_MODE = FORWARD;
     ALONG = ALONG_R;
@@ -223,6 +242,9 @@ void elementReset(void) {
     LRoadCount = RRoadCount = expRoadCount;
     LRawCount = RRawCount = 0;
     outOfTrack = 0;
+    /* 元素输出量复位：否则超时/急停后车还带着环岛打角或元素限速 */
+    elemSteerBiasDeg = 0;
+    elemSpeedRatio = 100;
     /* 重新发车/元素超时复位时重估阈值：原来阈值只在 main() 初始化时估一次，
      * 若视觉曾进入"爬线失败→阈值冻结"的死锁，停车后按 B2 也起不来，
      * 只能断电。这里只置标志，由下一帧的 loadRoad() 在快照空闲时执行，
@@ -249,15 +271,61 @@ static void debugReport(uint8 running) {
     uint16 now = msTick;
     int32 odo;
 
-    if ((uint16) (now - lastMs) < (uint16) (running ? 1000 : 250)) return;
+    /* 回放黑匣子时 40 ms 一条：512 条约 20 秒吐完，一行 33 字节，约 800 B/s */
+    if ((uint16) (now - lastMs) < (uint16) (running ? 1000 : (logDump ? 40 : 250))) return;
     lastMs = now;
+
+    /* ===== 黑匣子回放 =====
+     * 跑车时数据线接不上（不够长），所以把这一轮的元素状态存在 RAM 里，
+     * 停车后接上数据线自动吐出来。格式：
+     *   LOG  t,MODE,STG,CAND,RS,L,R,C,DUTY
+     * t 是相对发车时刻的毫秒，看相邻几条就能还原"进环岛那几秒"发生了什么。 */
+    if (logDump) {
+        if (logDumpIdx < logCount) {
+            int16 k = (int16) logW - (int16) logCount + (int16) logDumpIdx;
+            char dl[60];
+            int16 dn;
+            while (k < 0) k += ELEM_LOG_N;
+            dn = (int16) sprintf(dl, "LOG %u,%u,%u,%u,%u,%u,%u,%u,%d\r\n",
+                                 (unsigned) elemLog[k].t, (unsigned) elemLog[k].mode,
+                                 (unsigned) elemLog[k].stg, (unsigned) elemLog[k].cand,
+                                 (unsigned) elemLog[k].rs, (unsigned) elemLog[k].l,
+                                 (unsigned) elemLog[k].r, (unsigned) elemLog[k].c,
+                                 (int) elemLog[k].duty * 4);
+            if (dn > 0) usb_cdc_write_buffer((const uint8 *) dl, (uint16) dn);
+            logDumpIdx++;
+            return;                      // 这一拍只发一条日志
+        }
+        /* 吐完只结束回放，不清 logCount：数据留在 RAM 里，
+         * 再按一次 B3 可以从头再放一遍（第一次可能没抓全）。 */
+        logDump = 0;
+        logDumpIdx = 0;
+        {
+            char el[28];
+            int16 en = (int16) sprintf(el, "LOG END n=%u\r\n", (unsigned) logCount);
+            if (en > 0) usb_cdc_write_buffer((const uint8 *) el, (uint16) en);
+        }
+    }
+
     interrupt_global_disable();
     odo = odometer;
     interrupt_global_enable();
-    printf("ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\n",
-           odo, LRawCount, RRawCount, centerLineCount, aimRowDbg, threshold, darkCount,
-           dropFrameCnt, RUN_MODE, ALONG, trackIsOn(), faultFlags, currentSpeed, setSpeed,
-           currentDuty);
+    /* 一次格式化 + 一次发送。
+     * 不能用 printf：它经 putchar 逐字符调 usb_cdc_write_byte()，每个字符一次
+     * usb_cdc_write_buffer(…,1)，而单次调用最多等 USB_TIME_OUT_COUNT(≈2 ms)。
+     * 电脑端一旦读得慢（串口助手缓冲满、切窗口），一整行 130 个字符就会阻塞
+     * 130 × 2 ms ≈ 260 ms，主循环直接瘫掉——实测 DROP 涨到 80 帧/秒就是这么来的。
+     * 改成一次写 130 字节，最多 3 个 64 字节包，最坏也只等 3 次超时。 */
+    {
+        char line[168];
+        int16 n;
+        n = (int16) sprintf(line,
+                "ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d STG=%d CAND=%d RS=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\r\n",
+                odo, LRawCount, RRawCount, centerLineCount, aimRowDbg, threshold, darkCount,
+                dropFrameCnt, RUN_MODE, elemStageDbg, elemCandDbg, roundScoreDbg, ALONG,
+                trackIsOn(), faultFlags, currentSpeed, setSpeed, currentDuty);
+        if (n > 0) usb_cdc_write_buffer((const uint8 *) line, (uint16) n);
+    }
 }
 
 /* ===== 出界采样点 =====
@@ -302,6 +370,15 @@ static uint8 darkPoints(void) {
 void main(void) {
     clock_init(SYSTEM_CLOCK_96M);
     debug_init();
+    /* ===== 启动横幅 =====
+     * USB CDC 是在 debug_init() 里初始化的，电脑要等枚举完成才能打开串口，
+     * 所以先停 300 ms 再打——否则第一行会落在端口打开之前，看起来像"完全没输出"。
+     * 这两行也是现场判断"程序跑到哪一步"的唯一依据：
+     *   只看到 BOOT      → 卡在摄像头初始化
+     *   看到 BOOT + CAM  → 摄像头正常，后面是按键/发车/主循环
+     *   一行都没有       → USB 没枚举成功，或者端口选错（设备管理器里找"USB 串行设备"） */
+    system_delay_ms(300);
+    printf("BOOT v1.4\r\n");
     /* ===== 最早期初始化：状态灯与按键最先就绪 =====
      * 之前按键在摄像头之后才初始化，一旦摄像头初始化失败，按键会全部失效。 */
     gpio_init(STATUS_LED_PIN, GPO, STATUS_LED_OFF, GPO_PUSH_PULL); // 蓝色状态灯
@@ -328,6 +405,28 @@ void main(void) {
             }
         }
     }
+    printf("CAM ok\r\n");   // 摄像头初始化成功：走到这里说明后面只剩按键/发车/主循环
+    /* ===== 用状态灯编码 USB 状态（没有串口也能读）=====
+     * 闪灯次数 = DeviceState：
+     *   0 未连接 / 1 已上电 / 2 已复位 / 3 已分配地址 / 4 已配置 / 5 挂起
+     * 读到 4 次：固件侧发送条件已满足，printf 一定把数据推进 USB，
+     *            剩下的问题全在电脑端（端口没打开 / 工具不兼容）。
+     * 读到 0~3：USB 没配置成功，usb_cdc_write_buffer() 会在第一行就 return，
+     *            任何串口工具都不可能收到数据，要查线/供电/驱动/时钟。
+     * 这一段在"上电闪 3 下"之后、舵机自检之前，靠时序也能区分。 */
+    {
+        uint8 st = (uint8) DeviceState;
+        uint8 n;
+        system_delay_ms(400);
+        for (n = 0; n < st; n++) {
+            gpio_set_level(STATUS_LED_PIN, STATUS_LED_ON);
+            system_delay_ms(150);
+            gpio_set_level(STATUS_LED_PIN, STATUS_LED_OFF);
+            system_delay_ms(150);
+        }
+        system_delay_ms(600);
+    }
+
     /* 稳定优先：纠正中断优先级倒挂。
      * 库在 mt9v03x_init() 内把 INT1(VSYNC) 与 LCM_DMA 都设为最高 3，
      * 而 TIM1 的 5 ms 电机 PID 中断未设置优先级（默认最低 0），无法抢占 DMA。
@@ -399,8 +498,6 @@ void main(void) {
     frameBusy = 0;   // 丢弃选档期间累积的旧帧，第一拍处理发车后的当前画面
     while (1) {
         static uint16 lastFrameMs = 0;   // 最近一次收到完整帧的时刻
-        static uint16 elemEnterMs = 0;   // 进入当前元素阶段的时刻
-        static uint8 elemStage = 0;      // 当前元素阶段编号（RUN_MODE + 元素内部阶段）
         static uint16 elemSessionMs = 0; // 本次元素会话的起始时刻（总预算用）
         static uint8 elemSessionOn = 0;  // 1 = 正处于某个元素中
         static uint16 runStartMs = 0;    // 最近一次进入 RACE_RUNNING 的时刻
@@ -413,6 +510,19 @@ void main(void) {
                 outSeenMs = msTick;
                 outFrameCnt = 0;
                 darkCount = 0;
+                /* 发车：黑匣子从头开始记 */
+                logStartMs = msTick;
+                logLastMs = msTick;
+                logW = 0;
+                logCount = 0;
+                logDump = 0;
+                logDumpIdx = 0;
+            } else if (logCount && !logDump && DeviceState == USB_STATE_CONFIGURED) {
+                /* 离开 RUNNING（急停 / 完赛）：把这一轮记下的状态挂起，
+                 * 由 debugReport 慢慢吐到串口。停车后才能接数据线，
+                 * 所以必须存在 RAM 里等这一下。 */
+                logDump = 1;
+                logDumpIdx = 0;
             }
             lastRaceState = (uint8) raceState;
         }
@@ -430,10 +540,17 @@ void main(void) {
                 raceStart();
             }
         }
-        /* B3：紧急停车（不再限状态，任何时刻按下都停，避免"跑了停不下来"） */
+        /* B3：紧急停车；停车状态下再按一次 = 回放黑匣子。
+         * 为什么用按键触发而不是自动：跑车时数据线接不上，回放必须发生在
+         * "插好线、打开串口"之后，否则一停车就开始吐，数据全发进空气里。 */
         if (btnPressEdge & BTN_B3) {
-            raceStopNow();
-            motorForceStop(); // 双保险：直接清零两路占空比并取消助推
+            if (raceState == RACE_RUNNING || raceState == RACE_BRAKING) {
+                raceStopNow();
+                motorForceStop(); // 双保险：直接清零两路占空比并取消助推
+            } else if (logCount) {
+                logDump = 1;      // 从头回放
+                logDumpIdx = 0;
+            }
         }
         /* B4 长按 ≥2 s：标定一圈（按住到阈值时触发一次） */
         if (btnLongEvent) {
@@ -499,85 +616,119 @@ void main(void) {
                 }
             }
             if (raceState == RACE_RUNNING || raceState == RACE_BRAKING) {
-                if (ENABLE_CROSS && (RUN_MODE == CROSS ||
-                                     (RUN_MODE == FORWARD &&
-                                      ((RCorner && RRoadCount > 2) || (LCorner && LRoadCount > 2)) &&
-                                      LRoadCount < CROSS_MAX && RRoadCount < CROSS_MAX &&
-                                      /* 与 Cross.c 的 READY 门槛一致：否则会切到 CROSS
-                                       * 却永远进不了补线，ALONG/borderIn 被冻结到超时 */
-                                      centerLineCount && centerLineCount < CROSS_ENTER_COUNT))) {
-                    RUN_MODE = CROSS;
-                    runCross();
-                } else if (ENABLE_ROUND && (RUN_MODE == R_ROUND ||
-                                            (RUN_MODE == FORWARD && LRawCount > ROUND_MIN_PTS &&
-                                             LRoad[LRawCount - 1].x <= ROUND_FAR_ROW &&
-                                             /* 不再要求 RCorner 非零：RRoadCount 已经把
-                                              * 「被拐点裁短」(= 拐点序号 ≥3) 与「整条消失」
-                                              * (= 原始点数 0~2) 合并在一起，多加一项就把
-                                              * 主要的入口工况排除掉了 */
-                                             RRoadCount < ROUND_FAR_MAX))) {
-                    RUN_MODE = R_ROUND;
-                    borderIn = 1;
-                    runRRound(LCorner, RCorner);
-                } else if (ENABLE_ROUND && (RUN_MODE == L_ROUND ||
-                                            (RUN_MODE == FORWARD && RRawCount > ROUND_MIN_PTS &&
-                                             RRoad[RRawCount - 1].x <= ROUND_FAR_ROW &&
-                                             /* 与右侧环岛同理：LCorner 非零会把
-                                              * 「内侧线整条消失」这种工况排除掉 */
-                                             LRoadCount < ROUND_FAR_MAX))) {
-                    RUN_MODE = L_ROUND;
-                    borderIn = 1;
-                    runLRound(LCorner, RCorner);
-                } else {
-                    int8 beTurn = 0;
-                    /* 连接处中线点数不足时用入弯前冻结的转角维持转向，
-                     * 视觉一丢失就把方向打直，车会切进内侧或冲出去 */
-                    if (ENABLE_BEND_ENTRY && bendEntryTurn(&beTurn))
-                        setServoDuty(beTurn);
-                    else
-                        alongLine(centerLine, centerLineCount, getAimPos());
+                /* ================= 第一部分~第三部分的仲裁 =================
+                 * 三个模块互斥，同一时刻只有一个在跑，优先级：
+                 *     十字形环岛 XCross > 环岛 Round > 连续 S 弯 SCurve
+                 * 占用期间其他模块的 detect 一律不调用，所以不会出现
+                 * "在环岛里被 S 弯抢走"或"路口里被判成环岛"这类串扰。
+                 * 每个模块自己判退出（条件消失 / 超时），这里只兜总时长。 */
+                if (elemActive == ELEM_XCROSS) {
+                    if (xcBusy()) xcRun();
+                    else { xcExit(); elemActive = ELEM_NONE; }
+                } else if (elemActive == ELEM_ROUND) {
+                    if (rdBusy()) rdRun();
+                    else { rdExit(); elemActive = ELEM_NONE; }
+                } else if (elemActive == ELEM_SCURVE) {
+                    if (scBusy()) scRun();
+                    else { scExit(); elemActive = ELEM_NONE; }
                 }
 
-                /* 元素超时兜底：按"元素阶段"计时，而不是整个元素。
-                 * 环岛五阶段（READY→START→IN→END→EXIT）每进一个阶段就重置预算，
-                 * 否则单圈环岛总耗时会吃掉 8 s 预算、在圆周中途被强制复位。
-                 * 计时按真实毫秒而不是帧数，帧率波动时阈值不会跟着漂。 */
-                {
-                    uint8 stage = 0;
-                    if (RUN_MODE == R_ROUND) stage = (uint8) (1 + rroundStage());
-                    else if (RUN_MODE == L_ROUND) stage = (uint8) (8 + lroundStage());
-                    else if (RUN_MODE == CROSS) stage = (uint8) (16 + crossStage());
-
-                    if (RUN_MODE == FORWARD) {
-                        elemEnterMs = msTick;
-                        elemStage = 0;
-                        elemSessionOn = 0;
+                if (elemActive == ELEM_NONE) {
+                    if (xcDetect()) {
+                        elemActive = ELEM_XCROSS;
+                        xcEnter();
+                        xcRun();
+                    } else if (rdDetect()) {
+                        elemActive = ELEM_ROUND;
+                        rdEnter();
+                        rdRun();
+                    } else if (scDetect()) {
+                        elemActive = ELEM_SCURVE;
+                        scEnter();
+                        scRun();
                     } else {
-                        if (!elemSessionOn) {
-                            elemSessionOn = 1;
-                            elemSessionMs = msTick;
-                        }
-                        if ((uint16) (msTick - elemSessionMs) > ELEM_TOTAL_MS) {
-                            /* 总预算兜底：阶段来回翻转会不断重置单阶段计时，
-                             * 这里保证任何元素最多占用 ELEM_TOTAL_MS */
-                            elemSessionOn = 0;
-                            elemEnterMs = msTick;
-                            elemStage = 0;
-                            elementReset();
-                        } else if (stage != elemStage) {
-                            elemEnterMs = msTick;   // 进入新阶段：重置单阶段预算
-                            elemStage = stage;
-                        } else if ((uint16) (msTick - elemEnterMs) > ELEM_TIMEOUT_MS) {
-                            elemEnterMs = msTick;
-                            elemStage = 0;
-                            elementReset();
-                        }
+                        int8 beTurn = 0;
+                        /* 普通循迹：三个元素输出量在这一支里统一复位 */
+                        elemSteerBiasDeg = 0;
+                        elemSpeedRatio = 100;
+                        /* 连接处中线点数不足时用入弯前冻结的转角维持转向，
+                         * 视觉一丢失就把方向打直，车会切进内侧或冲出去 */
+                        if (ENABLE_BEND_ENTRY && bendEntryTurn(&beTurn))
+                            setServoDuty(beTurn);
+                        else
+                            alongLine(centerLine, centerLineCount, getAimPos());
                     }
                 }
+
+                /* RUN_MODE 现在只用于两件事：串口 MODE 字段、以及 loadRoad() 里
+                 * "只在 FORWARD 时重算 borderIn / centerLineDistance"的分支。
+                 * 控制量全部由模块通过三个输出量给出，不再走 ALONG。 */
+                if (elemActive == ELEM_XCROSS) RUN_MODE = RUN_X_CROSS;
+                else if (elemActive == ELEM_ROUND) RUN_MODE = rdSide() ? RUN_ROUND_L : RUN_ROUND_R;
+                else if (elemActive == ELEM_SCURVE) RUN_MODE = RUN_S_CURVE;
+                else RUN_MODE = FORWARD;
+
+                /* 串口诊断：STG = 元素内部阶段，CAND/RS = 环岛入口候选与积分 */
+                if (elemActive == ELEM_XCROSS) elemStageDbg = xcStage();
+                else if (elemActive == ELEM_ROUND) elemStageDbg = rdStage();
+                else if (elemActive == ELEM_SCURVE) elemStageDbg = scStage();
+                else elemStageDbg = 0;
+                elemCandDbg = rdCandBits();
+                roundScoreDbg = rdScore();
+
+                /* 黑匣子：20 Hz 记一条，跑完停车后自动吐出来 */
+                if ((uint16) (msTick - logLastMs) >= 50) {
+                    logLastMs = msTick;
+                    elemLog[logW].t = (uint16) (msTick - logStartMs);
+                    elemLog[logW].mode = (uint8) RUN_MODE;
+                    elemLog[logW].stg = elemStageDbg;
+                    elemLog[logW].cand = elemCandDbg;
+                    elemLog[logW].rs = roundScoreDbg;
+                    elemLog[logW].l = (uint8) (LRawCount > 255 ? 255 : LRawCount);
+                    elemLog[logW].r = (uint8) (RRawCount > 255 ? 255 : RRawCount);
+                    elemLog[logW].c = (uint8) (centerLineCount > 255 ? 255 : centerLineCount);
+                    /* duty 压到 1/4 存，±395 → ±98，一字节够用 */
+                    elemLog[logW].duty = (int8) (currentDuty / 4);
+                    logW = (uint8) ((logW + 1) % ELEM_LOG_N);
+                    if (logCount < ELEM_LOG_N) logCount++;
+                }
+
+                /* 总时长兜底：任何元素最多占用 ELEM_TOTAL_MS */
+                if (elemActive != ELEM_NONE) {
+                    if (!elemSessionOn) {
+                        elemSessionOn = 1;
+                        elemSessionMs = msTick;
+                    } else if ((uint16) (msTick - elemSessionMs) > ELEM_TOTAL_MS) {
+                        elementReset();
+                    }
+                } else {
+                    elemSessionOn = 0;
+                }
             } else {
-                elemEnterMs = msTick;
-                elemStage = 0;
                 elemSessionOn = 0;
+                elemStageDbg = 0;
+                elemCandDbg = 0;
+                roundScoreDbg = 0;
+                /* 离开比赛状态：元素模块全部退出，并把 RUN_MODE 复位。
+                 * 少了这一步，急停后串口 MODE 会一直停在最后那个元素值（例如 810），
+                 * 看起来像"卡在环岛里"，实际只是显示没复位。 */
+                if (elemActive != ELEM_NONE) {
+                    scExit();
+                    rdExit();
+                    xcExit();
+                    elemActive = ELEM_NONE;
+                }
+                RUN_MODE = FORWARD;
+                elemSteerBiasDeg = 0;
+                elemSpeedRatio = 100;
+                /* 静态标定：停车时也实时算环岛候选位。
+                 * 元素模块本身不运行（它们只在 RUNNING/BRAKING 下被调用），
+                 * 但 rdCandBits() 是只读的，只反映本帧视觉。
+                 * 推着车沿赛道逐点走，看 CAND 就知道"如果车在跑，这里会不会
+                 * 被判成环岛入口"，以及缺的是哪一条：
+                 *   右环岛 bit0 外侧>16点 / bit1 外侧末点行<=18 / bit2 内侧<7点
+                 *   左环岛 bit4/5/6 镜像          → 三条全 1 才是完整候选 */
+                elemCandDbg = rdCandBits();
             }
             frameBusy = 0;   // 消费完毕，允许 ISR 搬入下一帧
         } else if ((uint16) (msTick - lastFrameMs) > 1000) {
