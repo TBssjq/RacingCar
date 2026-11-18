@@ -44,31 +44,51 @@
 
 /* ---- 入口判据（与 main.c 的视野窗口同尺度） ---- */
 #define RD_OUTER_MIN     16   // 外侧边界原始点数下限（直道约 21~28）
-#define RD_FAR_ROW       18   // 外侧末点必须伸到该行以内（VIEW_FAR_ROW + 8）
+/* 外侧末点必须伸到的行号。原值 18 是按"外侧边界一路贴到窗口顶端"设的，
+ * 但实车在入口处扫到 L=55 点、末点行仍大于 18，于是 CAND 永远缺这一位
+ * （实测 CAND=5：bit0 与 bit2 都成立，只差 bit1）。
+ * 30 相当于"伸到画面中上部"即可；特异性改由下面"内侧不能被拐点裁短"保证，
+ * 不再靠苛刻的行号门槛。 */
+#define RD_FAR_ROW       30
 /* 内侧点数上限。原值 4 是按"内侧整条消失（0~2 点）"设的，但实车环岛入口的
- * 内侧线通常不是整条消失，而是**弯着退出画面侧边**，还剩 5~8 点就一直不满足，
+ * 内侧线通常不是整条消失，而是弯着退出画面侧边，还剩 5~8 点就一直不满足，
  * 于是"看得见要进环岛、舵机也有打角倾向，但状态机永远不切"。
- * 7 是实测口径下的折中：普通弯道被拐点裁短的内侧线一般 3~5 点，环岛入口 5~8 点，
- * 单靠点数分不开，还要靠下面两条（外侧够长 + 外侧末点伸到远端）兜住特异性。
- * 若普通急弯被误判成环岛（表现为入弯突然降到 50% 速度），把它退回 5。 */
+ * 放宽到 7 的前提是 rdCand() 里加了"内侧不能有拐点"：
+ * 普通弯道的内侧线是被拐点裁短的（RRoadCount = RCorner），会被那一条挡掉；
+ * 环岛缺口是真的没线（RCorner == 0）。两者用拐点区分，比用点数可靠。 */
 #define RD_INNER_MAX      7   // 内侧点数上限：< 7 即视为缺口
 #define RD_SCORE_NEED     3   // 积分确认门槛（3 帧里成 3 次）
 
 /* ---- 阶段推进门槛 ---- */
-#define RD_INNER_BACK    10   // 内侧边界"长回来"的点数（确认已绕进环内）
+/* START / IN 的时间兜底：入口到环内约 20~30 cm，50% 速度下约 0.6~0.8 s；
+ * 环内绕行约 0.8~1.2 s。这两条保证状态机一定往前走，不再依赖
+ * "边界先消失再长回"这种必须等车先动起来才成立的几何条件。
+ * 这条赛道的环直径固定，时间参数按实测调一次即可（不做通用化）。 */
+/* 打角保持的总时长决定"绕多少度"。实拍轨迹显示：大环（水滴岛）进去之后
+ * 绕了整整一圈又从来路出来（轨迹自交），说明保持时间偏长。
+ * 原来 START 700 + IN 1200 = 1.9 s，按 50% 速度折算约 360°；
+ * 正常环岛出口在 270° 左右，所以压到 500 + 800 = 1.3 s（约 -32%）。 */
+#define RD_START_MS      500
+#define RD_IN_MS         800
+#define RD_GAP_CONFIRM   3    // 缺口连续出现几帧就认定"入口已到"，直接进 START
+#define RD_INNER_BACK    10   // 内侧边界长回来的点数（确认已绕进环内）
 #define RD_OUT_BACK      20   // 对侧边界缺口后长回来的点数
 #define RD_END_PTS       25   // 出口侧边界恢复的点数门槛
 #define RD_END_COL_R    133   // 右环岛出口：右边界末点列号 < 该值（94+39）
 #define RD_END_COL_L     55   // 左环岛出口：左边界末点列号 > 该值（94-39）
 
 /* ---- 各阶段转向偏置（度，右环岛为正；左环岛自动取负） ---- */
-#define RD_BIAS_READY    12
-#define RD_BIAS_START    18
-#define RD_BIAS_IN        8
+/* 打角（度）。实拍：小环（圆岛）入口处舵机只"点一下"就回正，车沿外侧直穿，
+ * 说明入口段的转向余量不够 —— READY 从 18 抬到 22，START 从 22 抬到 24。
+ * 大环的表现相反（绕多了一圈），但它的主因是保持时间太长，
+ * 时间已从 1.9 s 压到 1.3 s，折合少绕约 110°，所以这里加 4° 不会让它更糟。 */
+#define RD_BIAS_READY    22
+#define RD_BIAS_START    24
+#define RD_BIAS_IN       12
 
 /* ---- 时间与速度 ---- */
 #define RD_SPEED_RATIO   50   // 环岛内目标速度比例（%）
-#define RD_READY_MS    1800   // READY 误判兜底（原 1200 太短：车还没开到环内就超时退回）
+#define RD_READY_MS    2500   // READY 误判兜底（原 1200 太短：车还没开到环内就超时退回）
 #define RD_STAGE_MS    8000   // 单阶段上限
 
 #define RD_ST_READY       1
@@ -86,28 +106,37 @@ static uint8 rdStageNo;      // 1~5，0 = 空闲
 static uint8 rdSideNo;       // 0 = 右环岛，1 = 左环岛
 static uint8 rdScoreR, rdScoreL;
 static uint8 rdGap1, rdGap2, rdGap3, rdGap4;   // 四个缺口的锁存
+static uint8 rdGapCnt;       // 内侧缺口连续帧数（READY 里用来确认入口）
 static uint16 rdMs;          // 本阶段进入时刻
 
 /* ------------------------- 入口候选 ------------------------- */
 /* side：0 = 右环岛（内侧是右边界），1 = 左环岛（内侧是左边界） */
 static uint8 rdCand(uint8 side) {
-    int16 outerRaw, innerPts;
+    int16 outerRaw, innerPts, innerCorner;
     int16 outerFarRow;
 
     if (side == RD_SIDE_R) {
         outerRaw = LRawCount;
         innerPts = RRoadCount;
+        innerCorner = RCorner;
         if (LRawCount <= 0 || LRawCount > expRoadCount) return 0;
         outerFarRow = (int16) LRoad[LRawCount - 1].x;
     } else {
         outerRaw = RRawCount;
         innerPts = LRoadCount;
+        innerCorner = LCorner;
         if (RRawCount <= 0 || RRawCount > expRoadCount) return 0;
         outerFarRow = (int16) RRoad[RRawCount - 1].x;
     }
 
     if (outerRaw <= RD_OUTER_MIN) return 0;      // 外侧不够长
-    if (outerFarRow > RD_FAR_ROW) return 0;      // 外侧没伸到远端（是在弯里拐出去了）
+    if (outerFarRow > RD_FAR_ROW) return 0;      // 外侧没伸到画面中上部（是在弯里拐出去了）
+    /* 内侧必须是"真消失"，不能是"被拐点裁短"。
+     * RRoadCount 在找到拐点时会等于拐点序号（≥3），这种情况下内侧线其实还在，
+     * 只是后面拐弯了——那是普通弯道，不是环岛缺口。
+     * 加上这一条之后才敢把 RD_INNER_MAX 放宽到 7、把 RD_FAR_ROW 放宽到 30：
+     * 特异性由"有没有拐点"来保证，而不是靠苛刻的行号门槛。 */
+    if (innerCorner) return 0;
     if (innerPts >= RD_INNER_MAX) return 0;      // 内侧还太完整，不是缺口
     return 1;
 }
@@ -136,6 +165,7 @@ void rdEnter(void) {
     rdStageNo = RD_ST_READY;
     rdMs = msTick;
     rdGap1 = rdGap2 = rdGap3 = rdGap4 = 0;
+    rdGapCnt = 0;
     rdScoreR = rdScoreL = 0;
 }
 
@@ -187,16 +217,37 @@ void rdRun(void) {
 
     switch (rdStageNo) {
     case RD_ST_READY:
-        if (rdInnerPts() < RD_INNER_MAX) rdGap1 = 1;          // 缺口出现过
-        if (rdGap1 && rdInnerRaw() > RD_INNER_BACK && !rdInnerCorner()) {
+        /* 缺口连续出现 RD_GAP_CONFIRM 帧就立刻进 START。
+         *
+         * 原来的条件是"缺口出现过、然后等内侧边界重新长回 >10 点"，
+         * 但内侧边界只有车已经拐进环里之后才会长回来，而车能不能拐进去
+         * 恰恰取决于 START 之后才实施的那套打角 —— 逻辑上是循环等待。
+         * 结果 READY 一直等到 RD_READY_MS 超时被踢回 FORWARD，
+         * 实车表现就是"进了 READY 又退出"。
+         * 现在缺口本身就是"入口已到"的证据：确认 3 帧就开始转。
+         * 保留"缺口已锁存且内侧长回"这条作为并行的快速通道，
+         * 覆盖"缺口闪一下、车已经自己拐进去"的情况。 */
+        if (rdInnerPts() < RD_INNER_MAX) {
+            if (rdGapCnt < 255) rdGapCnt++;
+            rdGap1 = 1;
+        } else {
+            rdGapCnt = 0;
+        }
+        if (rdGapCnt >= RD_GAP_CONFIRM ||
+            (rdGap1 && rdInnerRaw() > RD_INNER_BACK && !rdInnerCorner())) {
             rdStageNo = RD_ST_START;
             rdMs = msTick;
         }
         break;
 
     case RD_ST_START:
+        /* 进入环内的时间是可以用几何算出来的：入口到环内约 20~30 cm，
+         * 50% 速度下 0.6~0.8 s。所以除了"对侧缺口 + 长回"这条几何条件，
+         * 再加一条时间兜底——否则同样是循环等待（对侧边界要不要消失，
+         * 取决于车有没有拐进去，而拐进去正是这一阶段在做的事）。 */
         if (outerRaw < RD_INNER_MAX) rdGap2 = 1;              // 对侧缺口
-        if (rdGap2 && outerRaw > RD_OUT_BACK && !rdOuterCorner()) {
+        if ((rdGap2 && outerRaw > RD_OUT_BACK && !rdOuterCorner()) ||
+            (uint16) (msTick - rdMs) > RD_START_MS) {
             rdStageNo = RD_ST_IN;
             rdMs = msTick;
         }
@@ -204,7 +255,8 @@ void rdRun(void) {
 
     case RD_ST_IN:
         if (outerRaw < RD_INNER_MAX) rdGap3 = 1;              // 出口缺口
-        if (rdGap3 && outerRaw > RD_OUT_BACK) {
+        if ((rdGap3 && outerRaw > RD_OUT_BACK) ||
+            (uint16) (msTick - rdMs) > RD_IN_MS) {
             rdStageNo = RD_ST_END;
             rdMs = msTick;
         }
@@ -244,6 +296,7 @@ void rdExit(void) {
     rdStageNo = 0;
     rdMs = 0;
     rdGap1 = rdGap2 = rdGap3 = rdGap4 = 0;
+    rdGapCnt = 0;
     /* 积分一起清零：否则刚出环岛那一帧分数还在门槛上，会立刻被自己重新触发 */
     rdScoreR = rdScoreL = 0;
     elemSteerBiasDeg = 0;
@@ -255,6 +308,7 @@ void rdReset(void) {
     rdSideNo = RD_SIDE_R;
     rdScoreR = rdScoreL = 0;
     rdGap1 = rdGap2 = rdGap3 = rdGap4 = 0;
+    rdGapCnt = 0;
     rdMs = 0;
     elemSteerBiasDeg = 0;
     elemSpeedRatio = 100;
@@ -286,14 +340,14 @@ uint8 rdCandBits(void) {
         if (LRawCount > RD_OUTER_MIN) bits |= 0x01;
         if (farRow <= RD_FAR_ROW) bits |= 0x02;
     }
-    if (RRoadCount < RD_INNER_MAX) bits |= 0x04;
+    if (RRoadCount < RD_INNER_MAX && !RCorner) bits |= 0x04;
 
     if (RRawCount > 0 && RRawCount <= expRoadCount) {
         farRow = (int16) RRoad[RRawCount - 1].x;
         if (RRawCount > RD_OUTER_MIN) bits |= 0x10;
         if (farRow <= RD_FAR_ROW) bits |= 0x20;
     }
-    if (LRoadCount < RD_INNER_MAX) bits |= 0x40;
+    if (LRoadCount < RD_INNER_MAX && !LCorner) bits |= 0x40;
 
     return bits;
 }

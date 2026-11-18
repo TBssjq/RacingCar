@@ -108,6 +108,9 @@ static uint8 roundScoreDbg = 0;  // 环岛入口积分进度（到 3 触发）
 #define ELEM_LOG_N   512
 /* usb.h 里 DEVSTATE_CONFIGURED = 4，只有到这一步 USB 才真的能发数据 */
 #define USB_STATE_CONFIGURED   4
+/* 自动回放的重复周期：插线后每隔这么长时间重放一轮，
+ * 保证任何时刻打开串口终端都能抓到完整日志 */
+#define LOG_AUTO_MS         8000
 typedef struct {
     uint16 t;      // 相对发车时刻的毫秒（<65 s 不会回绕）
     uint8  mode;   // RUN_MODE
@@ -126,6 +129,7 @@ static uint16 logCount = 0;     // 有效条数
 static uint16 logStartMs = 0;    // 发车时刻，用于算相对时间
 static uint16 logLastMs = 0;     // 上次记录时刻
 static uint8  logDump = 0;       // 1 = 正在往外吐
+static uint16 logAutoMs = 0;     // 上次自动回放结束时刻，用于周期性重放
 static uint16 logDumpIdx = 0;   // 吐到第几条
 volatile uint8 borderIn; //主循环写、中断读
 uint8 switch1, switch2, ALONG = ALONG_R;
@@ -280,6 +284,19 @@ static void debugReport(uint8 running) {
      * 停车后接上数据线自动吐出来。格式：
      *   LOG  t,MODE,STG,CAND,RS,L,R,C,DUTY
      * t 是相对发车时刻的毫秒，看相邻几条就能还原"进环岛那几秒"发生了什么。 */
+
+    /* 插上线后每隔 LOG_AUTO_MS 自动回放一次，不必按 B3。
+     * 为什么不是"只放一次"：USB 枚举成功早于串口终端打开，单次回放很容易
+     * 整段发进空气里（实测就是这样：LG 有数据但一行都没收到）。
+     * 反复回放直到重新发车，什么时候开终端都能赶上。 */
+    if (!logDump && logCount &&
+        raceState != RACE_RUNNING && raceState != RACE_BRAKING &&
+        DeviceState == USB_STATE_CONFIGURED &&
+        (uint16) (msTick - logAutoMs) > LOG_AUTO_MS) {
+        logDump = 1;
+        logDumpIdx = 0;
+    }
+
     if (logDump) {
         if (logDumpIdx < logCount) {
             int16 k = (int16) logW - (int16) logCount + (int16) logDumpIdx;
@@ -300,6 +317,7 @@ static void debugReport(uint8 running) {
          * 再按一次 B3 可以从头再放一遍（第一次可能没抓全）。 */
         logDump = 0;
         logDumpIdx = 0;
+        logAutoMs = msTick;          // 下一次自动回放从这里起算
         {
             char el[28];
             int16 en = (int16) sprintf(el, "LOG END n=%u\r\n", (unsigned) logCount);
@@ -319,11 +337,14 @@ static void debugReport(uint8 running) {
     {
         char line[168];
         int16 n;
+        /* AL 字段已去掉：ALONG 在这个版本里没有任何读取者，是死变量。
+         * 换成 LG = 黑匣子已记录条数，直接看出"这一圈到底记没记上"。 */
         n = (int16) sprintf(line,
-                "ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d STG=%d CAND=%d RS=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\r\n",
+                "ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d STG=%d CAND=%d RS=%d LG=%u STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\r\n",
                 odo, LRawCount, RRawCount, centerLineCount, aimRowDbg, threshold, darkCount,
-                dropFrameCnt, RUN_MODE, elemStageDbg, elemCandDbg, roundScoreDbg, ALONG,
-                trackIsOn(), faultFlags, currentSpeed, setSpeed, currentDuty);
+                dropFrameCnt, RUN_MODE, elemStageDbg, elemCandDbg, roundScoreDbg,
+                (unsigned) logCount, trackIsOn(), faultFlags, currentSpeed, setSpeed,
+                currentDuty);
         if (n > 0) usb_cdc_write_buffer((const uint8 *) line, (uint16) n);
     }
 }
@@ -517,6 +538,7 @@ void main(void) {
                 logCount = 0;
                 logDump = 0;
                 logDumpIdx = 0;
+                logAutoMs = msTick;
             } else if (logCount && !logDump && DeviceState == USB_STATE_CONFIGURED) {
                 /* 离开 RUNNING（急停 / 完赛）：把这一轮记下的状态挂起，
                  * 由 debugReport 慢慢吐到串口。停车后才能接数据线，
@@ -550,6 +572,14 @@ void main(void) {
             } else if (logCount) {
                 logDump = 1;      // 从头回放
                 logDumpIdx = 0;
+                logAutoMs = msTick;
+            } else {
+                /* 按键收到了但一条都没记：回一行明确提示。
+                 * 这样能区分"按键没触发"和"黑匣子没记录"两种情况，
+                 * 不用再靠猜。 */
+                char nb[16];
+                int16 nn = (int16) sprintf(nb, "LOG NONE\r\n");
+                if (nn > 0) usb_cdc_write_buffer((const uint8 *) nb, (uint16) nn);
             }
         }
         /* B4 长按 ≥2 s：标定一圈（按住到阈值时触发一次） */
@@ -597,6 +627,15 @@ void main(void) {
 
                 if (guard >= 2) {
                     /* 连接处时间窗内：完全免判，画面里的黑区是弯道外侧的底布 */
+                    outFrameCnt = 0;
+                    outOfTrack = 0;
+                } else if (elemActive != ELEM_NONE) {
+                    /* 元素进行中（环岛/十字/S 弯）也免判。
+                     * 环岛入口与十字中心都是一大片白，车身两侧的场地底布会同时
+                     * 进入画面，DARK 很容易凑满 5 点；一旦判出界，
+                     * raceState 会离开 RUNNING，而元素派发整段在 RUNNING 分支里 ——
+                     * 元素当场被强制退出，表现为"刚打了一点角就回正"。
+                     * 元素内部有自己的超时兜底，不怕卡死，所以这里放开。 */
                     outFrameCnt = 0;
                     outOfTrack = 0;
                 } else if (dark >= OUT_SAMPLE_POINTS && blind) {
@@ -689,7 +728,7 @@ void main(void) {
                     elemLog[logW].c = (uint8) (centerLineCount > 255 ? 255 : centerLineCount);
                     /* duty 压到 1/4 存，±395 → ±98，一字节够用 */
                     elemLog[logW].duty = (int8) (currentDuty / 4);
-                    logW = (uint8) ((logW + 1) % ELEM_LOG_N);
+                    logW = (uint16) ((logW + 1) % ELEM_LOG_N);   // 不能强转 uint8：512 会截成 0
                     if (logCount < ELEM_LOG_N) logCount++;
                 }
 
