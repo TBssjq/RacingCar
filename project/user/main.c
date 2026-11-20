@@ -99,12 +99,12 @@ static uint8 elemStageDbg = 0;   // 元素内部阶段
 static uint8 elemCandDbg = 0;    // 环岛入口候选位：bit0 右、bit1 左
 static uint8 roundScoreDbg = 0;  // 环岛入口积分进度（到 3 触发）
 
-/* ===== 黑匣子：跑车时记录元素状态，停车接上数据线再读 =====
+/* ===== 黑匣子：跑车时记录元素状态，停车后按 B4 上传 =====
  * 现场限制：跑车时数据线不够长，只能停车后读串口。所以把关键状态按 20 Hz
- * 记进 RAM（512 条 × 50 ms ≈ 25 s，够跑一整圈），停车后按 B3 回放。
+ * 记进 RAM（512 条 × 50 ms ≈ 25 s，够跑一整圈），停车后按 B4 一次性上传。
  * 每条的格式（逗号分隔，前缀 LOG）：
  *   LOG  t,MODE,STG,CAND,RS,L,R,C,DUTY
- * 看连续的 t 就能还原"进环岛那几秒到底发生了什么"。 */
+ * 全部记录发完后以 ENDDDDD 结尾，看连续的 t 就能还原"进环岛那几秒到底发生了什么"。 */
 #define ELEM_LOG_N   512
 /* usb.h 里 DEVSTATE_CONFIGURED = 4，只有到这一步 USB 才真的能发数据 */
 #define USB_STATE_CONFIGURED   4
@@ -127,6 +127,7 @@ static uint16 logStartMs = 0;    // 发车时刻，用于算相对时间
 static uint16 logLastMs = 0;     // 上次记录时刻
 static uint8  logDump = 0;       // 1 = 正在往外吐
 static uint16 logDumpIdx = 0;   // 吐到第几条
+static uint8  logDumpReq = 0;    // B4 已请求上传；停车后由 debugReport 启动
 volatile uint8 borderIn; //主循环写、中断读
 uint8 switch1, switch2, ALONG = ALONG_R;
 Point centerLine[expRoadCount], LRoad[expRoadCount], RRoad[expRoadCount];
@@ -175,7 +176,7 @@ void loadRoad();
  * 把 2 s 长按拉成十几秒，现场表现就是"按键失效"。
  *   B2：短按 = 发车（需已识别到赛道）    长按 1 s = 强制发车
  *   B3：短按 = 紧急停车（任何状态都生效）
- *   B4：短按 = 舵机自检                  长按 2 s = 标定一圈 */
+ *   B4：短按 = 上传黑匣子（停车后执行）  长按 2 s = 标定一圈 */
 #define BTN_B2          0x01
 #define BTN_B3          0x02
 #define BTN_B4          0x04
@@ -262,22 +263,35 @@ static uint8 outFrameCnt = 0;
 static uint8 darkCount = 0;
 
 /* ===== USB CDC 调试输出 =====
- * 屏幕已从硬件上移除，里程标定、阈值、故障码全部靠 USB CDC 读取（debug_init 已打开）。
- * 串口没有连接时 usb_cdc_write_buffer 会立即返回，不占运行时间。
- *   待发车：每 250 ms 打印全部读数，推车 1 米看 ODO 的增量即可标定 PULSE_PER_METER
- *   跑车中：每 1 s 打印一行，确认目标速度、实际速度、占空比与故障码 */
+ * 默认只在按下 B4 后上传黑匣子；平时不发送周期性数据，避免跑车时占用 USB/主循环。
+ * 黑匣子格式：LOG t,MODE,STG,CAND,RS,L,R,C,DUTY；全部发完后固定输出 ENDDDDD。
+ * 需要恢复原来的 ODO 周期调试行时，把 ENABLE_LIVE_TELEMETRY 改为 1。 */
+#define ENABLE_LIVE_TELEMETRY   0
+
 static void debugReport(uint8 running) {
     static uint16 lastMs = 0;
     uint16 now = msTick;
-    int32 odo;
 
-    /* 回放黑匣子时 40 ms 一条：512 条约 20 秒吐完，一行 33 字节，约 800 B/s */
-    if ((uint16) (now - lastMs) < (uint16) (running ? 1000 : (logDump ? 40 : 250))) return;
+    /* B4 请求只在停车后启动，避免上传过程拖慢行驶中的控制循环。
+     * 如果 B4 是在行驶中按下的，请求会保留到 RACE_STOPPED 后再执行。 */
+    if (!logDump && logDumpReq && !running) {
+        logDump = 1;
+        logDumpIdx = 0;
+        logDumpReq = 0;
+        lastMs = (uint16) (now - 40);   // 下一拍立即发第一条
+    }
+
+#if (ENABLE_LIVE_TELEMETRY)
+    if (!logDump && (uint16) (now - lastMs) < (uint16) (running ? 1000 : 250)) return;
+#else
+    if (!logDump) return;
+    if ((uint16) (now - lastMs) < 40) return;
+#endif
     lastMs = now;
 
     /* ===== 黑匣子回放 =====
      * 跑车时数据线接不上（不够长），所以把这一轮的元素状态存在 RAM 里，
-     * 停车后接上数据线自动吐出来。格式：
+     * 停车后按 B4 再上传。格式：
      *   LOG  t,MODE,STG,CAND,RS,L,R,C,DUTY
      * t 是相对发车时刻的毫秒，看相邻几条就能还原"进环岛那几秒"发生了什么。 */
     if (logDump) {
@@ -296,48 +310,52 @@ static void debugReport(uint8 running) {
             logDumpIdx++;
             return;                      // 这一拍只发一条日志
         }
-        /* 吐完只结束回放，不清 logCount：数据留在 RAM 里，
-         * 再按一次 B3 可以从头再放一遍（第一次可能没抓全）。 */
+        /* 全部记录已发完：结束回放并给出固定结束标记。
+         * 数据仍留在 RAM 里，再按一次 B4 可以从头再传一遍。 */
         logDump = 0;
         logDumpIdx = 0;
         {
-            char el[28];
-            int16 en = (int16) sprintf(el, "LOG END n=%u\r\n", (unsigned) logCount);
-            if (en > 0) usb_cdc_write_buffer((const uint8 *) el, (uint16) en);
+            static const char endMark[] = "ENDDDDD\r\n";
+            usb_cdc_write_buffer((const uint8 *) endMark, (uint16) (sizeof(endMark) - 1));
         }
+        return;                          // ENDDDDD 之后不再输出任何内容
     }
 
-    interrupt_global_disable();
-    odo = odometer;
-    interrupt_global_enable();
-    /* 一次格式化 + 一次发送。
-     * 不能用 printf：它经 putchar 逐字符调 usb_cdc_write_byte()，每个字符一次
-     * usb_cdc_write_buffer(…,1)，而单次调用最多等 USB_TIME_OUT_COUNT(≈2 ms)。
-     * 电脑端一旦读得慢（串口助手缓冲满、切窗口），一整行 130 个字符就会阻塞
-     * 130 × 2 ms ≈ 260 ms，主循环直接瘫掉——实测 DROP 涨到 80 帧/秒就是这么来的。
-     * 改成一次写 130 字节，最多 3 个 64 字节包，最坏也只等 3 次超时。 */
+#if (ENABLE_LIVE_TELEMETRY)
     {
-        char line[168];
-        int16 n;
-        n = (int16) sprintf(line,
-                "ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d STG=%d CAND=%d RS=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\r\n",
-                odo, LRawCount, RRawCount, centerLineCount, aimRowDbg, threshold, darkCount,
-                dropFrameCnt, RUN_MODE, elemStageDbg, elemCandDbg, roundScoreDbg, ALONG,
-                trackIsOn(), faultFlags, currentSpeed, setSpeed, currentDuty);
-        if (n > 0) usb_cdc_write_buffer((const uint8 *) line, (uint16) n);
+        int32 odo;
+        interrupt_global_disable();
+        odo = odometer;
+        interrupt_global_enable();
+        /* 一次格式化 + 一次发送。
+         * 不能用 printf：它经 putchar 逐字符调 usb_cdc_write_byte()，每个字符一次
+         * usb_cdc_write_buffer(…,1)，而单次调用最多等 USB_TIME_OUT_COUNT(≈2 ms)。
+         * 电脑端一旦读得慢（串口助手缓冲满、切窗口），一整行 130 个字符就会阻塞
+         * 130 × 2 ms ≈ 260 ms，主循环直接瘫掉——实测 DROP 涨到 80 帧/秒就是这么来的。
+         * 改成一次写 130 字节，最多 3 个 64 字节包，最坏也只等 3 次超时。 */
+        {
+            char line[168];
+            int16 n;
+            n = (int16) sprintf(line,
+                    "ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d STG=%d CAND=%d RS=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d\r\n",
+                    odo, LRawCount, RRawCount, centerLineCount, aimRowDbg, threshold, darkCount,
+                    dropFrameCnt, RUN_MODE, elemStageDbg, elemCandDbg, roundScoreDbg, ALONG,
+                    trackIsOn(), faultFlags, currentSpeed, setSpeed, currentDuty);
+            if (n > 0) usb_cdc_write_buffer((const uint8 *) line, (uint16) n);
+        }
     }
+#endif
 }
 
 /* ===== 出界采样点 =====
  * 采样点同时受三条约束：
  *   1. 行必须小于 BODY_ROW（车身在画面里的最上行），否则读到的是车身暗块。
- *      原来近端三点放在 84~88 行，20 cm / 45° 安装后车身已经顶到 80 行，
- *      这三点长期就是暗的——远端两点一暗就凑齐"5 点全暗"，直道上偶发停车
- *      多半出在这里；
+ *      原来近端三点放在 84~88 行，车身顶边到 80 行后这三点长期就是暗的，
+ *      远端两点一暗就凑齐"5 点全暗"，直道上偶发停车多半出在这里；
  *   2. 列要落在赛道内侧。摄像头视场远大于赛道，画面左右两侧是场地外暗区，
  *      原 47 / 141 在偏窄赛道上已经在线外，等于又白送两个暗点；
  *   3. 越远的行赛道越窄，列要同步内收，保持 5 个点都落在赛道里。
- *   4. 全部落在视野窗口内（行 10~99、列 34~153），窗口外是写成暗区的区域。
+ *   4. 全部落在视野窗口内（行 34~99、列 34~153），窗口外是写成暗区的区域。
  * 现场标定：直道正常行驶时这 5 个点的暗点数应为 0（串口 DARK 字段可观察）。 */
 #define OUT_ROW_NEAR  (BODY_ROW - 4)   //近端采样行 = 76，车身顶边以上留 4 像素余量
 
@@ -441,7 +459,7 @@ void main(void) {
     gpio_init(IO_PB0, GPI, 0, GPI_PULL_UP);   // 拨码 SW1
     gpio_init(IO_PB2, GPI, 0, GPI_PULL_UP);   // B2 发车
     gpio_init(IO_PB3, GPI, 0, GPI_PULL_UP);   // B3 急停
-    gpio_init(IO_PB4, GPI, 0, GPI_PULL_UP);   // B4 自检 / 标定
+    gpio_init(IO_PB4, GPI, 0, GPI_PULL_UP);   // B4 黑匣子上传 / 标定
     gpio_init(IO_P90, GPO, 0, GPO_PUSH_PULL); // 蜂鸣器（本车未装）
     gpio_init(STATUS_LED_PIN, GPO, STATUS_LED_OFF, GPO_PUSH_PULL); // 摄像头初始化可能改动端口，重新配置一次
     servoSelfTest(); //上电舵机自检：左右各摆约 30°，约 1.4 s，结束回机械 90°（电机不参与）
@@ -481,7 +499,7 @@ void main(void) {
     LThreshold = RThreshold = threshold = imageInitThreshold();
     frameBusy = 0;   // 消费开机首帧，让后续帧正常搬运
     /* ===== 上电自动选档：拨码 SW1/SW2 选 4 组，取该组中较保守的一档 =====
-     * 按键已简化：B2 发车 / B3 紧急停车 / B4 舵机自检（长按 2 s = 标定一圈），
+     * 按键已简化：B2 发车 / B3 紧急停车 / B4 黑匣子上传（长按 2 s = 标定一圈），
      * 因此不再需要按键选档，上电即按拨码定档并初始化电机与编码器。 */
     switch2 = gpio_get_level(IO_PB1);
     switch1 = gpio_get_level(IO_PB0);
@@ -517,12 +535,7 @@ void main(void) {
                 logCount = 0;
                 logDump = 0;
                 logDumpIdx = 0;
-            } else if (logCount && !logDump && DeviceState == USB_STATE_CONFIGURED) {
-                /* 离开 RUNNING（急停 / 完赛）：把这一轮记下的状态挂起，
-                 * 由 debugReport 慢慢吐到串口。停车后才能接数据线，
-                 * 所以必须存在 RAM 里等这一下。 */
-                logDump = 1;
-                logDumpIdx = 0;
+                logDumpReq = 0;   // 新一轮发车取消上一轮尚未执行的 B4 请求
             }
             lastRaceState = (uint8) raceState;
         }
@@ -540,16 +553,12 @@ void main(void) {
                 raceStart();
             }
         }
-        /* B3：紧急停车；停车状态下再按一次 = 回放黑匣子。
-         * 为什么用按键触发而不是自动：跑车时数据线接不上，回放必须发生在
-         * "插好线、打开串口"之后，否则一停车就开始吐，数据全发进空气里。 */
+        /* B3：紧急停车（任何状态都生效）。黑匣子上传统一由 B4 触发，
+         * 这样不会在还没插好数据线时把数据发进空气里。 */
         if (btnPressEdge & BTN_B3) {
             if (raceState == RACE_RUNNING || raceState == RACE_BRAKING) {
                 raceStopNow();
                 motorForceStop(); // 双保险：直接清零两路占空比并取消助推
-            } else if (logCount) {
-                logDump = 1;      // 从头回放
-                logDumpIdx = 0;
             }
         }
         /* B4 长按 ≥2 s：标定一圈（按住到阈值时触发一次） */
@@ -557,11 +566,15 @@ void main(void) {
             btnLongEvent = 0;
             if (raceState == RACE_IDLE) raceSetLap();
         }
-        /* B4 短按（松开时判定，且本次不是长按）：舵机左右各摆 15°。
-         * 只在停车状态执行：自检要占用 0.9 秒，行驶中做这件事等于闭眼开车。 */
+        /* B4 短按（松开时判定，且本次不是长按）：上传黑匣子。
+         * 行驶中按下只登记请求，等停车后再上传；已经在上传时重按则从头再传。 */
         if (btnShortB4) {
             btnShortB4 = 0;
-            if (raceState == RACE_IDLE || raceState == RACE_STOPPED) servoSelfTest();
+            if (logDump) {
+                logDump = 0;
+                logDumpIdx = 0;
+            }
+            logDumpReq = 1;
         }
         raceTask();
 
@@ -676,7 +689,7 @@ void main(void) {
                 elemCandDbg = rdCandBits();
                 roundScoreDbg = rdScore();
 
-                /* 黑匣子：20 Hz 记一条，跑完停车后自动吐出来 */
+                /* 黑匣子：20 Hz 记一条，停车后按 B4 再上传 */
                 if ((uint16) (msTick - logLastMs) >= 50) {
                     logLastMs = msTick;
                     elemLog[logW].t = (uint16) (msTick - logStartMs);

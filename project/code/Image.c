@@ -10,7 +10,7 @@ const static int8 data dirF[4][2] = {{-2, 0},{0, 2},{2, 0},{0, -2}},
 uint8 banUpdateThreshold = 0, LThreshold, RThreshold, threshold, centerLineDistance = 18;
 /* 去畸变查表只在 USE_REFLECTION = 1 时参与编译：
  * 表本身 120×188×2 = 45120 B const，关闭时若不裁掉会白占约 45 KB Flash。
- * 当前 20 cm / 45° 安装与表的 25 cm / 39° 标定不符，表已整体旁路。 */
+ * 当前 24 cm / 27° 安装与机内广角校正均与表的 25 cm / 39° 标定不符，表已整体旁路。 */
 #if USE_REFLECTION
 const uint8 reflection[120][188][2];
 #endif
@@ -404,9 +404,9 @@ void getGodRoadLine(Point roadLine[], int16 count) {
         roadLine[i].y = reflection[px][py][1];
     }
 #else
-    /* 旁路查表：表按 25 cm / 39° 标定，当前 20 cm / 45° 透视已变，
-     * 查表会把中线整体拉偏。这里保留原始斜视坐标，
-     * 纯跟踪的 dx / dy 仍按同一套像素坐标计算，只是几何不再是上帝视角。 */
+    /* 旁路查表：表按旧安装 25 cm / 39° 标定；当前为 24 cm / 27°，
+     * 且摄像头自带广角校正，查旧表会把中线整体拉偏。
+     * 这里保留校正后的原始坐标，纯跟踪的 dx / dy 仍按同一套像素坐标计算。 */
     if (count <= 0 || roadLine == 0) return;
 #endif
 }

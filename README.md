@@ -60,7 +60,8 @@
 | 舵机 | 200 Hz PWM，中值 `steerMid = 2975`，机械修正 `STEER_TRIM = -58` |
 | 电机 | 双直流减速电机，17 kHz PWM，AB 相编码器正交解码 |
 | 调试 | USB CDC 虚拟串口，`printf` 输出 |
-| 安装 | 摄像头高度 20 cm，俯角 45° |
+| 安装 | 摄像头高 24 cm，光轴与立杆夹角 63°（俯角 27°），距车头 15 cm；FOV 120°，机内广角校正 |
+| 车体 | 全长 29 cm，两轮间距 18.2 cm，轮半径 3.1 cm |
 
 ### 1.1 引脚
 
@@ -144,10 +145,12 @@ Program Size: data=101.5  edata+hdata=8192  xdata=51892  const=3761  code=83514
 |---|---|
 | B2 | 发车（`RACE_IDLE` / `RACE_STOPPED` 时可发） |
 | B3 | 任意状态紧急停车 |
-| B4 短按 | 停车状态下舵机左右各摆 30° |
+| B4 短按 | 上传黑匣子全部记录，末尾输出 `ENDDDDD`；行驶中按下则停车后上传 |
 | B4 长按 2 s | 待发车状态下把当前里程记为一圈 |
 
 `CALIB_REQUIRED = 0`：不标定也能发车，此时 `raceStart()` 把 `lapPulse` 设为 `0x7FFFFFFF`，不会因里程自动刹停，只能靠 B3 手动停。
+
+黑匣子默认不主动上传；只有 B4 短按才会发送全部记录。需要恢复周期性 `ODO=` 调试行时，把 `main.c` 的 `ENABLE_LIVE_TELEMETRY` 改为 `1`。
 
 ## 5. 图像链路
 
@@ -155,8 +158,8 @@ Program Size: data=101.5  edata+hdata=8192  xdata=51892  const=3761  code=83514
 DMA 写 mt9v03x_image
   → DMA 完成中断 mt9v03x_frame_snapshot() 搬 22.5 KB 到 mt9v03x_frame，置 frameBusy
   → 主循环 frameBusy == 1
-      cutViewRegion()               视野窗口：只保留行 10~99、列 34~153，四周置暗
-      getLStart / getRStart         行 95 → 13，列 36 → 151，车身行以下用窄列
+      cutViewRegion()               视野窗口：只保留行 34~99、列 34~153，四周置暗
+      getLStart / getRStart         行 95 → 37，列 36 → 151，车身行以下用窄列
       getLBorder / getRBorder       四邻域爬线，局部阈值每 2 步重算，turn < 8
       getGodRoadLine                当前旁路 reflection 查表（USE_REFLECTION = 0）
       filterRoad                    因果平均 (前 + 今 + 1) >> 1
@@ -181,7 +184,7 @@ DMA 写 mt9v03x_image
 |---|---|
 | 前瞻点 | `getAimPos()` = `c3 + currentSpeed / 40`，夹 `c3 ~ c3 + SPEED_LIMIT/40` |
 | 取点方式 | `PP_ARC_MODE = 0`：按下标 `pos`，并夹 `count-1-12`；`= 1`：按弧长累计，线短时沿末端切线外推 |
-| 纯跟踪 | `d = atan2_int(2·L·dy, dx² + dy²)`，`L = PP_LOOKAHEAD_PX = 18`，`dx = 99 - 点行 + 18`（下限 30），`dy = 94 - 点列` |
+| 纯跟踪 | `d = atan2_int(2·L·dy, dx² + dy²)`，`L = PP_LOOKAHEAD_PX = 28`，`dx = 99 - 点行 + 28`（下限 30），`dy = 94 - 点列` |
 | 远端前馈 | `dy = dyAim + (dyFar - dyAim) / 3`，远端点在前瞻点之后 12 个点距（约 24 像素） |
 | 舵机换算 | `currentDuty = d × c1 / 20`，夹 ±395；`d` 先夹 ±30 |
 | 舵机环 | `steerPid` Kp 100 / Ki 0 / Kd 100，输出夹 ±395 |
@@ -257,7 +260,7 @@ DMA 写 mt9v03x_image
 | `STEER_TRIM` | -58 | 舵机机械中值修正，停车、自检、初始化三处统一叠加 |
 | `TRACK_BIAS_PX` | 0 | 纯跟踪瞄准点横向偏置 |
 | `MOTOR_DIFF_TRIM` | 0 | 左右轮目标速度差补偿 |
-| `PP_LOOKAHEAD_PX` | 18 | 纯跟踪等效轴距（转角分母里的 L），唯一调参入口 |
+| `PP_LOOKAHEAD_PX` | 28 | 纯跟踪等效轴距（转角分母里的 L），唯一调参入口 |
 | `PP_ARC_MODE` | 0 | 前瞻取法：0 按下标，1 按弧长（见第 12 节） |
 | `PP_ARC_EXT_MAX` | 24 | 弧长模式下远端点沿切线外推的上限 |
 | `PP_DX_MIN` | 30 | 纯跟踪纵向距离下限，防止贴脸点打满舵 |
@@ -279,11 +282,11 @@ DMA 写 mt9v03x_image
 | `CROSS_MAX` | 14 | 十字入口两侧点数上限 |
 | `CROSS_ENTER_COUNT` / `CROSS_EXIT_COUNT` | 13 / 24 | 十字进入 / 退出中线点数门槛 |
 | `ROUND_MIN_PTS` / `ROUND_FAR_ROW` | 16 / `VIEW_FAR_ROW+8` | 环岛入口：外侧边界点数下限、末点必须伸到的行 |
-| `ROUND_FAR_MAX` | 4 | 环岛入口：内侧边界点数上限 |
-| `ROUND_READY_MS` | 1200 | 环岛误判兜底 |
-| `VIEW_CUT_FAR` / `VIEW_CUT_NEAR` | 10 / 20 | 视野窗口上、下裁掉的行数 |
+| `ROUND_FAR_MAX` | 7 | 环岛入口：内侧边界点数上限 |
+| `ROUND_READY_MS` | 1800 | 环岛误判兜底 |
+| `VIEW_CUT_FAR` / `VIEW_CUT_NEAR` | 34 / 20 | 视野窗口上、下裁掉的行数 |
 | `VIEW_CUT_LEFT` / `VIEW_CUT_RIGHT` | 34 / 34 | 视野窗口左、右裁掉的列数 |
-| `VIEW_FAR_ROW` / `VIEW_NEAR_ROW` | 10 / 99 | 由上面四项推导 |
+| `VIEW_FAR_ROW` / `VIEW_NEAR_ROW` | 34 / 99 | 由上面四项推导 |
 | `VIEW_COL_L` / `VIEW_COL_R` | 34 / 153 | 由上面四项推导 |
 | `OUT_BLIND_MS` / `OUT_CONFIRM_FRAMES` | 200 / 3 | 出界盲区时间与确认帧数 |
 | `OUT_START_GRACE_MS` | 300 | 发车宽限 |
@@ -297,7 +300,17 @@ DMA 写 mt9v03x_image
 
 ## 10. 串口协议
 
-待发车每 250 ms 一行，跑车中每 1 s 一行：
+默认不输出周期性数据。停车后按 B4 短按，才上传黑匣子全部记录：
+
+```
+LOG t,MODE,STG,CAND,RS,L,R,C,DUTY
+...
+ENDDDDD
+```
+
+`t` 为相对发车时刻的毫秒，`DUTY` 为舵机偏移（已从 1/4 压缩还原）。最后一行固定为 `ENDDDDD`，之后不再发送任何内容。
+
+`ENABLE_LIVE_TELEMETRY = 1` 时恢复原来的周期性调试行（待发车每 250 ms、跑车中每 1 s）：
 
 ```
 ODO=%ld L=%d R=%d C=%d AIM=%d THR=%d DARK=%d DROP=%u MODE=%d AL=%d STA=%d ERR=%d SPD=%d DS=%d DUTY=%d

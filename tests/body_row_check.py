@@ -1,7 +1,7 @@
 """视野窗口 + 车身入镜下起点搜索的核对。
 
-窗口按现场草图：只保留中间一块，四周各裁一圈。
-  行 10~99（上裁 10 行、下裁 20 行，保留 90 行；远端比上一版多留 10 行）
+窗口按 24 cm 高 / 27° 俯角：只保留中间一块，四周各裁一圈。
+  行 34~99（上裁 34 行、下裁 20 行，保留 66 行；地平线约在行 27）
   列 34~153（左右各裁 34 列，保留 120 列）
 窗口外整块写成暗区。脚本核对四件事：
   1. 裁切后窗口外全为 0，窗口内保持原值；
@@ -21,7 +21,7 @@ HIDE_ROW_REF = 90
 BODY_ROW = 80
 
 # ---- Image.h ----
-VIEW_CUT_FAR = 10
+VIEW_CUT_FAR = 34
 VIEW_CUT_NEAR = 20
 VIEW_CUT_LEFT = 34
 VIEW_CUT_RIGHT = 34
@@ -33,7 +33,7 @@ HALF_BLOCK = 2
 
 # ---- Motor.h / Motor.c ----
 STEER_REF_ROW = VIEW_NEAR_ROW
-DEVICE_H = 18
+DEVICE_H = 28
 C1 = 260
 STEER_DUTY_DIV = 20
 
@@ -117,8 +117,8 @@ keep_cols = VIEW_COL_R - VIEW_COL_L + 1
 print("  行 %d~%d（%d 行）、列 %d~%d（%d 列），共 %d 像素"
       % (VIEW_FAR_ROW, VIEW_NEAR_ROW, keep_rows,
          VIEW_COL_L, VIEW_COL_R, keep_cols, keep_rows * keep_cols))
-print("  相比上一版（上裁 20 行）远端多保留 %d 行，点列更长、远端趋势前馈不退化"
-      % (20 - VIEW_CUT_FAR))
+print("  远端裁切 %d 行，地平线约在行 27；窗口从行 %d 开始，保留地面约 2.5 m 前瞻"
+      % (VIEW_CUT_FAR, VIEW_FAR_ROW))
 img = make_image(40, 145)
 outside = [(r, c) for r in range(H) for c in range(W)
            if not (VIEW_FAR_ROW <= r <= VIEW_NEAR_ROW and VIEW_COL_L <= c <= VIEW_COL_R)]
@@ -196,4 +196,4 @@ for aim_row, dy in ((50, 10), (47, 20), (31, 20), (31, 30)):
           % (aim_row, dy, d_now, duty_now, d_old, duty_old, d_now / d_old))
 print("  近端裁掉 %d 行后按画面底边算 dx 会虚增同样的量，转角被压小；"
       % VIEW_CUT_NEAR)
-print("  取窗口下沿折算后转角放大约 1.5~1.6 倍，对应实车\"转弯幅度不够\"。")
+print("  取窗口下沿折算后转角放大约 1.45~1.6 倍，对应实车\"转弯幅度不够\"。")
